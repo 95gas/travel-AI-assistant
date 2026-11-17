@@ -1,0 +1,33 @@
+[project]
+name = "weroad-travel-assistant"
+version = "0.1.0"
+description = "Agentic travel assistant for WeRoad.it built with Python, Pydantic, PydanticAI, and FastMCP."
+requires-python = ">=3.11"
+dependencies = [
+    # Structured data validation and schema contracts
+    "pydantic>=2.9.0",
+    # Agentic framework with MCP toolset support (used by GenericAgent)
+    "pydantic-ai>=0.1.0",
+    # Model Context Protocol server SDK (FastMCP)
+    "mcp>=1.2.0",
+    # Async HTTP client and HTML parser for weroad.it sitemaps and tour pages
+    "httpx>=0.27.2",
+    "beautifulsoup4>=4.12.3",
+    "pydantic-ai-slim[huggingface]>=2.54.0",
+    "transformers>=5.17.0",
+    "torch>=2.15.0",
+    "accelerate>=1.16.0",
+    "fastapi>=0.163.1",
+    "fastmcp>=4.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+]
+
+[tool.uv]
+# Treat this repository as an application workspace rather than a buildable wheel
+package = false

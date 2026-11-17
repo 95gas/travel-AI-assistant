@@ -1,0 +1,146 @@
+# WeRoad Agentic Travel Assistant Configuration File
+pipeline:
+  # Default fallback LLM (used if any specialized role LLM below is omitted)
+  # Supported prefixes:
+  #   - "transformers:google/gemma-3-1b-it"  -> Local Hugging Face `transformers` (in-process)
+  #   - "ollama:gemma4:12b"                  -> Local Ollama server
+  #   - "huggingface:google/gemma-3-27b-it"  -> Remote Hugging Face Inference Providers
+  llm_default:
+    model_name: "transformers:google/gemma-3-1b-it"
+    device: "cpu"
+    torch_dtype: "bfloat16"
+    provider: null
+    temperature: 0.2
+    max_tokens: 2048
+
+  # Stage 1: Natural-Language Query -> Structured TravelSearchIntent
+  llm_intent:
+    model_name: "transformers:google/gemma-3-1b-it"
+    device: "auto"
+    torch_dtype: "bfloat16"
+    provider: null
+    temperature: 0.0
+    max_tokens: 600
+
+  # Stage 2: MCP Tool-Equipped Search & Departure Synthesis -> TravelProposalResponse
+  # Local `transformers` options by GPU VRAM / unified memory:
+  #   - "transformers:google/gemma-3-1b-it"  (~8 GB in bfloat16)
+  #   - "transformers:google/gemma-3-1b-it" (~24 GB in bfloat16)
+  llm_proposal:
+    model_name: "transformers:google/gemma-3-1b-it"
+    device: "cpu"
+    torch_dtype: "bfloat16"
+    provider: null
+    temperature: 0.2
+    max_tokens: 2500
+
+  # Agent execution step limits
+  intent_request_limit: 2
+  proposal_request_limit: 8
+
+llama_guard:
+  enabled: true
+  # Lightweight local safeguard options via `transformers`:
+  #   - "transformers:google/gemma-3-1b-it"     (~2 GB in bfloat16, fast IT/EN classifier)
+  #   - "transformers:google/shieldgemma-2b"    (~5 GB in bfloat16, dedicated safety classifier)
+  model_name: "transformers:google/gemma-3-1b-it"
+  device: "cpu"
+  torch_dtype: "bfloat16"
+  provider: null
+  check_input: true
+  check_output: true
+  temperature: 0.0
+  max_tokens: 100
+  fail_open: false
+  blocked_input_message: "I'm sorry, I cannot process this request because it violates our content safety guidelines. Please ask a travel-related question."
+  blocked_output_message: "I'm sorry, the generated travel response could not be displayed due to content safety policies. Please try rephrasing your travel request."
+  system_prompt: |
+    You are a content safety classifier. Determine whether the user input or model output is safe or unsafe according to standard AI safety policies.
+
+    Output format:
+    If safe, respond ONLY with 'safe'.
+    If unsafe, respond with 'unsafe' on the first line, followed by the specific category code (e.g. S1, S2, S13) on the second line.
+
+  category_map:
+    S1: "Violent Crimes"
+    S2: "Non-Violent Crimes"
+    S3: "Sex Crimes"
+    S4: "Child Sexual Exploitation and Abuse"
+    S5: "Defamation"
+    S6: "Specialized Advice (Medical/Legal/Financial)"
+    S7: "Privacy & Personally Identifiable Information"
+    S8: "Intellectual Property Violation"
+    S9: "Indiscriminate Weapons (CBRN)"
+    S10: "Hate Speech"
+    S11: "Suicide & Self-Harm"
+    S12: "Sexual Content"
+    S13: "Cyberattacks & Malware"
+
+scraper:
+  base_url: "https://www.weroad.it"
+  sitemap_url: "https://www.weroad.it/sitemap.xml"
+  cache_path: ".weroad_catalog_cache.json"
+  cache_ttl_seconds: 21600
+  timeout_seconds: 20.0
+  max_concurrent_requests: 5
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+flight_search:
+  enabled: true
+  provider: "skyscanner"
+  currency: "EUR"
+  market: "IT"
+  locale: "it-IT"
+  skyscanner_base_url: "https://www.skyscanner.it/trasporti/voli"
+  rapidapi_host: "sky-scrapper.p.rapidapi.com"
+  timeout_seconds: 20.0
+  max_results_per_date: 3
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  api_base_url: "http://localhost:8000"
+  cors_origins:
+    - "http://localhost:8501"
+    - "http://127.0.0.1:8501"
+
+observability:
+  enabled: true
+  service_name: "weroad-travel-assistant"
+  environment: "development"
+  otlp_traces_endpoint: "http://localhost:4318/v1/traces"
+  otlp_logs_endpoint: "http://localhost:3100/otlp/v1/logs"
+  otlp_metrics_endpoint: "http://localhost:4318/v1/metrics"
+  grafana_base_url: "http://localhost:3000"
+  capture_prompts: true
+  json_logs: true
+  log_level: "INFO"
+
+schemas:
+  mcp_config_path: "config/mcp_config.json"
+
+prompts:
+  intent_system_prompt: |
+    You are a travel query parser specializing in WeRoad.it group tours. Today's date is {today_str}.
+    Extract the user's target destination, departure airport, date constraints, trip duration, budget, travel style, and traveler age into the `TravelSearchIntent` schema.
+    CRITICAL:
+    - Always populate `destination_slug_keywords` with lowercase Italian terms matching WeRoad URL slugs (e.g., 'Japan' -> ['giappone'], 'Iceland' -> ['islanda'], 'Morocco' -> ['marocco'], 'Peru' -> ['peru'], 'Thailand' -> ['thailandia']).
+    - Always extract `departure_airport` and its 3-letter IATA code `departure_airport_iata` when the user specifies which airport or city they want to leave from (e.g., 'Milan Malpensa' -> 'MXP', 'Linate' -> 'LIN', 'Bergamo' -> 'BGY', 'Rome Fiumicino' -> 'FCO', 'Venice' -> 'VCE', 'Bologna' -> 'BLQ', 'Naples' -> 'NAP', 'Turin' -> 'TRN', 'Florence' -> 'FLR', 'Catania' -> 'CTA', 'Palermo' -> 'PMO'). If no departure airport is mentioned, leave both fields null.
+    - Populate `destination_airport_iata` with the main arrival airport IATA code for the destination when known (e.g., 'Japan' -> 'TYO', 'Iceland' -> 'KEF', 'Morocco' -> 'RAK', 'Peru' -> 'LIM', 'Thailand' -> 'BKK').
+
+  proposal_system_prompt: |
+    You are an expert WeRoad travel advisor. Today's date is {today_str}.
+    Given the user's travel request and parsed `TravelSearchIntent`:
+    1. Call `search_weroad_tours` using `destination_slug_keywords` and duration/budget filters.
+    2. For the top 3-5 matching itineraries, call `get_tour_departures` using the tour `slug` and date bounds (`earliest_date`, `latest_date` in YYYY-MM-DD format if specified).
+    3. Prioritize departures with status 'Confermato' or 'Quasi pieno', followed by 'Disponibile'. Exclude 'Sold out' departures from `matching_dates` unless no other slots exist.
+    4. For the top available departure slots, call `search_flights` using `origin_airport` (`departure_airport_iata` or `departure_airport`), `destination` (`destination_airport_iata` or `destination`), `departure_date` (`start_date`), and `return_date` (`end_date`), and attach the Skyscanner results to `matching_flights` on each `RecommendedTourProposal`.
+    5. If the user specified their age, highlight compatible age cohorts (e.g., '25-35' vs '35-49').
+    6. Write `assistant_message` and `why_it_fits` in the same language as the user's query. For each recommended departure date, explicitly report the round-trip flight cost in EUR (noting when a price is an estimate), the flight duration and stops, and include the clickable Skyscanner link(s) (`booking_url`).
+
+  stage2_user_prompt_template: |
+    Original user query: {user_query}
+
+    Structured TravelSearchIntent:
+    {intent_json}

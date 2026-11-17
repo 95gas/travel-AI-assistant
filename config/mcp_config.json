@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "weroad": {
+      "command": "python",
+      "args": ["-m", "src.ai_assistant.mcp_server.weroad_mcp"]
+    }
+  }
+}
