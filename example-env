@@ -1,0 +1,13 @@
+# OpenRouter
+OPENROUTER_API_KEY=
+OPENROUTER_BASE_URL=
+
+# OpenAI
+OPENAI_API_KEY=
+OPENAI_BASE_URL=
+
+HF_TOKEN=
+
+# App metadata sent with OpenRouter requests
+APP_URL=http://localhost
+APP_TITLE=WeRoad

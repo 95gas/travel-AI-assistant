@@ -1,5 +1,5 @@
 """
-Domain Schemas & Configuration Models (`common/schemas.py`)
+Domain Schemas & Configuration Models (`schemas.py`)
 ===========================================================
 Defines all Pydantic v2 data contracts shared across `agent.py`, the Llama Guard
 moderator, `config_management.py`, the WeRoad parser, the MCP tool server,
@@ -275,18 +275,25 @@ class WeRoadPromptsConfig(BaseModel):
         default=(
             "You are a travel query parser specializing in WeRoad.it group tours. "
             "Today's date is {today_str}.\n"
-            "Extract the user's target destination, departure airport, date constraints, trip duration, budget, "
-            "travel style, and traveler age into the `TravelSearchIntent` schema.\n"
+            "Extract the user's input language, target destination, departure airport, date constraints, "
+            "trip duration, budget, travel style, and traveler age into the `TravelSearchIntent` schema.\n"
             "CRITICAL:\n"
+            "- Always detect the language of the user's input and set `user_language` to its ISO 639-1 code "
+            "(e.g., 'it', 'en', 'es', 'fr', 'de').\n"
             "- Always populate `destination_slug_keywords` with lowercase Italian terms "
             "matching WeRoad URL slugs (e.g., 'Japan' -> ['giappone'], 'Iceland' -> ['islanda'], "
             "'Morocco' -> ['marocco'], 'Peru' -> ['peru'], 'Thailand' -> ['thailandia']).\n"
-            "- Extract `departure_airport` and `departure_airport_iata` when specified."
+            "- Extract `departure_airport` and `departure_airport_iata` when specified; if omitted, "
+            "populate `missing_airport_reply` in the exact same language as the user's input."
         )
     )
     proposal_system_prompt: str = Field(
         default=(
             "You are an expert WeRoad travel advisor. Today's date is {today_str}.\n"
+            "CRITICAL LANGUAGE REQUIREMENT:\n"
+            "- Write ALL user-facing fields (`assistant_message`, `why_it_fits`, and `alternative_suggestions`) "
+            "in the EXACT SAME LANGUAGE as the user's original query (`TravelSearchIntent.user_language`).\n"
+            "- Do NOT switch to English or Italian if the user wrote in another language.\n\n"
             "Given the user's travel request and parsed `TravelSearchIntent`:\n"
             "1. Call `search_weroad_tours` using `destination_slug_keywords` and duration/budget filters.\n"
             "2. For the top 2-3 matching itineraries, call `get_tour_departures` (batching tool calls in parallel when possible) "
@@ -295,13 +302,16 @@ class WeRoadPromptsConfig(BaseModel):
             "Exclude 'Sold out' departures from `matching_dates` unless no other slots exist.\n"
             "4. Call `search_flights` (batching tool calls in parallel when possible) for the top 2-3 available departure dates "
             "and attach results to `matching_flights`.\n"
-            "5. Report flight costs in EUR, flight durations, stops, and clickable Skyscanner links (`booking_url`)."
+            "5. Report flight costs in EUR, flight durations, stops, and clickable Skyscanner links (`booking_url`) "
+            "in the user's input language."
         )
     )
     stage2_user_prompt_template: str = Field(
         default=(
             "Original user query: {user_query}\n\n"
-            "Structured TravelSearchIntent:\n{intent_json}"
+            "Structured TravelSearchIntent:\n{intent_json}\n\n"
+            "REMINDER: Write `assistant_message`, every `why_it_fits`, and `alternative_suggestions` "
+            "strictly in the same language as the original user query above (`user_language`)."
         )
     )
     missing_departure_airport_message: str = Field(
@@ -353,6 +363,13 @@ class DepartureStatus(str, Enum):
 class TravelSearchIntent(BaseModel):
     """Structured travel criteria extracted from a user's natural-language query."""
 
+    user_language: str = Field(
+        default="en",
+        description=(
+            "ISO 639-1 language code detected from the user's input query "
+            "(e.g., 'it' for Italian, 'en' for English, 'es' for Spanish, 'fr' for French, 'de' for German)."
+        ),
+    )
     destination: str = Field(
         ...,
         description="Target country, region, or city requested by the user.",
@@ -371,6 +388,13 @@ class TravelSearchIntent(BaseModel):
     departure_airport_iata: Optional[str] = Field(
         None,
         description="3-letter IATA airport code for the departure airport (e.g., 'MXP', 'FCO', 'VCE').",
+    )
+    missing_airport_reply: Optional[str] = Field(
+        None,
+        description=(
+            "When `departure_airport` is null, a polite, concise follow-up question written in the EXACT "
+            "same language as the user's input (`user_language`) asking which departure airport they prefer."
+        ),
     )
     destination_airport_iata: Optional[str] = Field(
         None,
@@ -476,7 +500,7 @@ class RecommendedTourProposal(BaseModel):
     starting_price_eur: Optional[float] = None
     why_it_fits: str = Field(
         ...,
-        description="Concise explanation of why this itinerary matches the user's request.",
+        description="Concise explanation written in the exact same language as the user's input query explaining why this itinerary matches the request.",
     )
     matching_dates: List[DepartureSlot] = Field(
         default_factory=list,
@@ -493,12 +517,12 @@ class TravelProposalResponse(BaseModel):
 
     assistant_message: str = Field(
         ...,
-        description="Friendly, helpful response in the user's language summarizing the recommended tours and dates.",
+        description="Friendly, helpful response written in the exact same language as the user's input query summarizing the recommended tours, dates, and flights.",
     )
     proposals: List[RecommendedTourProposal] = Field(default_factory=list)
     alternative_suggestions: Optional[str] = Field(
         None,
-        description="Helpful fallback advice if exact dates or budgets had limited availability.",
+        description="Helpful fallback advice written in the exact same language as the user's input query if exact dates or budgets had limited availability.",
     )
     needs_departure_airport: bool = Field(
         default=False,

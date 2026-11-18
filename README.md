@@ -6,7 +6,7 @@ An end-to-end, safety-guarded agentic travel advisor built with **Python**, **Py
 
 Planning a group adventure involves coordinating tour availability, age cohorts, budget constraints, and round-trip flights from a specific departure airport. The **WeRoad Agentic Travel Assistant** automates this workflow through a transparent, multi-stage AI pipeline:
 
-- **Natural-Language Understanding & Airport Verification**: Extracts structured travel preferences (destination, Italian slug keywords, travel dates, duration, budget, and traveler age) from free-form English or Italian queries, prompting for an origin airport whenever omitted.
+- **Multilingual Natural-Language Understanding & Airport Verification**: Automatically detects the user's input language (e.g., English, Italian, Spanish, French, German, Portuguese, and more), extracts structured travel preferences (destination, Italian slug keywords, travel dates, duration, budget, and traveler age), prompts for an origin airport in the user's language whenever omitted, and delivers all final recommendations in that exact same language.
 - **Live Catalog & Flight Matching via MCP**: Connects an LLM agent to live **WeRoad.it** itinerary/departure scrapers and **Skyscanner** flight search tools over MCP (`stdio`).
 - **Transparent Reasoning Stream**: Configured out of the box with **OpenRouter's Free Models Router (`openrouter:openrouter/free`)** and unified reasoning tokens enabled, emitting real-time Server-Sent Events (`POST /api/v1/chat/stream`) to a reactive **React + Tailwind CSS** web interface (`index.html`) so users can watch every safety check, model thought, parsed intent decision, and flight/tour lookup as it happens.
 - **Flexible & Production-Ready**: Works out of the box with zero GPU requirements via **OpenRouter** (`openrouter:openrouter/free`), while also supporting 100% local execution via **Ollama** or Hugging Face **`transformers`**, native cloud providers (**OpenAI**, **Anthropic**, **Gemini**, **Groq**, **Mistral**, **DeepSeek**, etc.), input/output **Llama Guard** safety moderation, and full **OpenTelemetry** observability (**Grafana Tempo**, **Loki**, and **Prometheus**).
@@ -15,10 +15,13 @@ Planning a group adventure involves coordinating tour availability, age cohorts,
 
 ## Key Features
 
+- **Multilingual Query Understanding & Same-Language Responses (`schemas.py`, `orchestrator.py`, `config/config.yaml`)**:
+  - Automatically detects the ISO 639-1 language code (`user_language`) of any incoming user message—whether written in English, Italian, Spanish, French, German, Portuguese, or another language.
+  - Translates destination concepts into normalized Italian slug keywords for `WeRoad.it` catalog lookups while ensuring all user-facing outputs (`assistant_message`, tour `why_it_fits` summaries, `alternative_suggestions`, and missing-airport follow-up questions) are returned in the exact same language as the user's input.
 - **Two-Stage Agentic Orchestration (`src/ai_assistant/core/orchestrator.py`)**:
-  - **Stage 1 — Intent Extraction**: Parses natural-language travel queries into a structured `TravelSearchIntent` schema (destination, normalized Italian URL slug keywords, departure airport & 3-letter IATA code, destination IATA code, date bounds, trip duration, budget, travel style, and traveler age).
-  - **Departure Airport Gate**: Automatically prompts the user for their departure airport if omitted (`needs_departure_airport = True`) so flight searches are always anchored to a real origin hub.
-  - **Stage 2 — Tool-Equipped Search & Synthesis**: Uses MCP tools to search the WeRoad catalog, inspect live departure dates, look up matching round-trip flights on Skyscanner, and synthesize a structured `TravelProposalResponse` in the user's language.
+  - **Stage 1 — Intent Extraction**: Parses natural-language travel queries into a structured `TravelSearchIntent` schema (`user_language`, destination, normalized Italian URL slug keywords, departure airport & 3-letter IATA code, localized missing-airport reply, destination IATA code, date bounds, trip duration, budget, travel style, and traveler age).
+  - **Departure Airport Gate**: Automatically prompts the user in their detected input language for their departure airport if omitted (`needs_departure_airport = True`) so flight searches are always anchored to a real origin hub.
+  - **Stage 2 — Tool-Equipped Search & Synthesis**: Uses MCP tools to search the WeRoad catalog, inspect live departure dates, look up matching round-trip flights on Skyscanner, and synthesize a structured `TravelProposalResponse` strictly in the user's input language.
 - **OpenRouter Free Models Router & Unified Reasoning (`src/ai_assistant/core/agent.py`, `config/config.yaml`)**:
   - Defaults to `openrouter:openrouter/free`, which dynamically routes requests to available free models supporting required capabilities (tool calling, structured outputs, and reasoning tokens).
   - Supports OpenRouter's unified `reasoning` parameters (`reasoning_enabled`, `reasoning_effort`, `reasoning_max_tokens`, and `reasoning_exclude`) per pipeline stage and streams model thinking tokens live as `ThinkingPart` (`reasoning`) events via `run_stream()`.
@@ -35,8 +38,8 @@ Planning a group adventure involves coordinating tour availability, age cohorts,
 - **Skyscanner Round-Trip Flight Integration (`src/ai_assistant/tools/flight_search.py`)**:
   - Resolves cities, countries, and airports to 3-letter IATA codes, builds pre-filled Skyscanner round-trip URLs (`skyscanner.it`), queries live Skyscanner itineraries via RapidAPI when `RAPIDAPI_KEY` is configured, and falls back to route-calibrated EUR cost and duration benchmarks.
 - **Input & Output Safety Guardrails (`src/ai_assistant/core/guardrail.py`)**:
-  - Moderates every incoming user query and outgoing assistant response across safety categories `S1`–`S13` with configurable fail-closed/fail-open policies (configured with `openrouter:openrouter/free` and `reasoning_enabled: false` for fast binary classification, or compatible with local Ollama / `openrouter:meta-llama/llama-guard-4-12b`).
-- **Multiple User Interfaces (`index.html`, `server.py`)**:
+  - Moderates every incoming user query and outgoing assistant response across safety categories `S1`–`S13` with configurable fail-closed/fail-open policies (`config/config.yaml` defaults to `openrouter:openrouter/free` with `max_tokens: 1024` so reasoning-capable router models never truncate before emitting `safe`/`unsafe`; also compatible with local Ollama or `openrouter:meta-llama/llama-guard-4-12b`).
+- **Reactive Web UI & FastAPI Backend (`index.html`, `server.py`)**:
   - **Reactive Web Chat UI (`index.html`)**: Single-file React 18 + Tailwind CSS frontend served directly by FastAPI (`/` and `/ui`) featuring a live collapsible **Agent Reasoning & Execution Stream** timeline, interactive WeRoad itinerary cards, departure date tables, Skyscanner deep links, and run telemetry.
   - **FastAPI REST & SSE Backend (`server.py`)**: Exposes `/api/v1/chat/stream` (SSE), `/api/v1/chat` (JSON), `/health`, and `/metrics`.
 - **Full OpenTelemetry Observability (`src/ai_assistant/observability/observability.py` & `grafana/`)**:
@@ -102,17 +105,126 @@ Planning a group adventure involves coordinating tour availability, age cohorts,
 
 ---
 
+## Working Principles
+
+This section explains how each subsystem operates internally from the moment a user submits a message to the final rendered itinerary and flight proposal.
+
+### 1. Two-Stage Orchestration & Departure Airport Gate (`orchestrator.py`)
+
+Rather than asking a single prompt to parse ambiguous user language and call multiple live scrapers simultaneously, `WeRoadTravelAssistant` splits execution into four deterministic phases:
+
+1. **Step 0 — Input Guardrail (`guardrail_input`)**:
+   - Before any travel logic runs, `LlamaGuardModerator.check_input()` evaluates the raw user prompt against safety categories `S1`–`S13`.
+   - If flagged `unsafe` (or if moderation fails while `fail_open: false`), execution halts immediately and returns a safe refusal response (`guardrail_blocked = True`).
+2. **Stage 1 — Structured Intent Extraction (`intent_extraction`)**:
+   - `intent_agent` (`GenericAgent` with `output_type=TravelSearchIntent` and `reasoning_effort="low"`) converts free-form queries in any supported language into a validated Pydantic object, detecting `user_language` (ISO 639-1) alongside the user's travel constraints.
+   - **Italian Keyword Normalization**: Because WeRoad.it URLs use Italian slugs (e.g., `/viaggi/giappone-360`), the intent parser translates destinations from any input language into lowercase Italian slug keywords (`"Japan"` / `"Japón"` / `"Japon"` → `["giappone"]`, `"Iceland"` / `"Islandia"` → `["islanda"]`, `"Morocco"` / `"Marruecos"` → `["marocco"]`).
+   - **IATA Resolution**: Extracts the traveler's origin airport/city (`departure_airport` and 3-letter `departure_airport_iata`, such as `"Milan Malpensa"` → `"MXP"`) and infers the main arrival hub (`destination_airport_iata`, such as `"Japan"` → `"TYO"`).
+   - **Departure Airport Gate**: When `pipeline.require_departure_airport` is `true` and both `departure_airport` and `departure_airport_iata` are `null`, the orchestrator skips Stage 2 and returns `needs_departure_airport = True` with a localized prompt (`missing_airport_reply` or language-matched fallback) asking which airport the user is flying from. (In the web UI, selecting an airport in the top bar appends `(departing from <IATA>)` to the query automatically.)
+3. **Stage 2 — MCP Tool-Equipped Search & Synthesis (`proposal_synthesis`)**:
+   - `proposal_agent` (`GenericAgent` with `output_type=TravelProposalResponse`, `reasoning_effort="medium"`, and the `weroad` MCP toolset) receives both the original query and the JSON-serialized `TravelSearchIntent`.
+   - Guided by `proposal_system_prompt`, the agent follows a three-step tool workflow:
+     1. Calls `search_weroad_tours` to discover matching group itineraries.
+     2. Calls `get_tour_departures` on the top 2–3 itineraries to inspect live scheduled dates (*turni*), prioritizing `Confermato` and `Quasi pieno` slots over `Disponibile`, and filtering out `Sold out` slots.
+     3. Calls `search_flights` for the top 2–3 available departure windows using the exact `start_date` and `end_date` of each tour slot.
+   - Finally, the agent synthesizes `TravelProposalResponse` strictly in the same language as the user's input (`assistant_message`, `why_it_fits`, and `alternative_suggestions`), translating Italian catalog metadata naturally while highlighting compatible age cohorts (e.g., `25-35` vs. `35-49`), EUR tour prices, round-trip flight fares, durations, stops, and direct Skyscanner links.
+4. **Step 3 — Output Guardrail (`guardrail_output`)**:
+   - `_serialize_proposal_for_moderation()` flattens the structured `TravelProposalResponse` (assistant message, tour descriptions, flight details, URLs, and alternative suggestions) into plain text and runs `LlamaGuardModerator.check_output()` before yielding the final `StreamStepType.FINAL` event.
+
+---
+
+### 2. How WeRoad Tours & Live Departures Are Retrieved (`weroad_parser.py`)
+
+`WeRoadClient` interacts directly with `https://www.weroad.it` using asynchronous `httpx` requests and `BeautifulSoup`:
+
+1. **XML Sitemap Indexing & 6-Hour Local Cache (`search_catalog`)**:
+   - When `search_weroad_tours` is invoked, `WeRoadClient` loads `.weroad_catalog_cache.json` if it exists and is younger than `scraper.cache_ttl_seconds` (`21600` seconds = 6 hours).
+   - On cache miss or expiration, it fetches `https://www.weroad.it/sitemap.xml` (recursively resolving child sitemaps if a sitemap index is returned) and extracts all `/viaggi/<slug>` itinerary URLs.
+   - If sitemap discovery yields too few matches for a keyword, it performs fallback discovery against `/destinazioni/<keyword>`.
+   - Candidate itineraries are matched against the normalized Italian `keywords` and filtered by `min_days`, `max_days`, and `max_budget_eur`, returning `WeRoadTourSummary` objects.
+2. **Multi-Layer Departure Date Extraction (`fetch_departures`)**:
+   - When `get_tour_departures(slug, earliest_date, latest_date)` is called, `WeRoadClient` fetches `https://www.weroad.it/viaggi/<slug>` (with concurrency governed by `scraper.max_concurrent_requests: 5`).
+   - Because modern travel pages hydrate departure calendars dynamically, the parser inspects three structured layers in order of reliability:
+     1. **Embedded Next.js State (`<script id="__NEXT_DATA__">`)**: Extracts structured departure objects, dates, base/discounted prices, age brackets, and availability flags directly from the page's hydrated JSON state.
+     2. **Structured Linked Data (`<script type="application/ld+json">`)**: Parses Schema.org `Event` / `TouristTrip` offers when present.
+     3. **DOM / HTML Fallback**: Parses rendered departure cards/rows via BeautifulSoup as a resilient fallback.
+   - Every extracted slot is normalized into a `DepartureSlot` with `start_date`, `end_date`, `price_eur`, `original_price_eur` (when a promotion is active), `age_bracket` (`18-24`, `25-35`, `35-49`, or `Tutti`), and normalized `DepartureStatus` (`Confermato`, `Quasi pieno`, `Disponibile`, `Sold out`, or `Sconosciuto`), filtered to `[earliest_date, latest_date]`.
+
+---
+
+### 3. How Skyscanner Flights Are Retrieved (`flight_search.py`)
+
+`FlightSearchClient` pairs each available WeRoad departure slot (`start_date` to `end_date`) with round-trip flight options (`FlightOption`) from the user's origin airport:
+
+1. **Airport, City & Country to IATA Resolution**:
+   - `search_flights` accepts either a 3-letter IATA code (`"MXP"`, `"FCO"`, `"TYO"`) or a natural-language city/airport/country name (`"Milan Malpensa"`, `"Rome"`, `"Japan"`, `"Iceland"`).
+   - `FlightSearchClient` normalizes both `origin_airport` and `destination` into standardized 3-letter IATA codes using an internal lookup table of major Italian/international airports and country gateway hubs.
+2. **Pre-Filled Skyscanner Round-Trip URL Construction**:
+   - Using `flight_search.skyscanner_base_url` (`https://www.skyscanner.it/trasporti/voli`), `market` (`IT`), `locale` (`it-IT`), and `currency` (`EUR`), the client builds a direct deep link formatted with the origin IATA, destination IATA, outbound date (`YYMMDD`), return date (`YYMMDD`), and adult passenger count.
+   - Every returned `FlightOption` attaches this `booking_url` so users can open the exact round-trip search on Skyscanner with one click.
+3. **Dual-Mode Fare & Duration Retrieval (Live RapidAPI + Benchmark Fallback)**:
+   - **Live API Mode (`RAPIDAPI_KEY` configured)**:
+     - Queries Skyscanner's **Sky-Scrapper** endpoint on RapidAPI (`sky-scrapper.p.rapidapi.com`).
+     - Resolves the origin and destination IATA codes to Skyscanner `skyId` / `entityId` identifiers, queries round-trip itineraries for `(departure_date, return_date, adults)`, filters by `max_stops` if requested, and returns up to `max_results_per_date` (`3`) real-time `FlightOption` quotes (`is_estimated_price = False`) with operating carrier names, exact EUR fares, total flight durations, and stop counts.
+   - **Route-Calibrated Benchmark Mode (when `RAPIDAPI_KEY` is omitted or rate-limited)**:
+     - Automatically falls back to deterministic, route-calibrated round-trip EUR fare, flight duration, and stop-count estimates (`is_estimated_price = True`) computed from origin/destination geographic regions and seasonality.
+     - Both the LLM prompt and UI explicitly label estimated fares (`is_estimated_price: true`) while providing the live pre-filled Skyscanner `booking_url` for exact checkout pricing.
+
+---
+
+### 4. MCP Stdio Tool Server Lifecycle (`weroad_mcp.py` & `agent.py`)
+
+- **Process Isolation & Environment Normalization**: When `WeRoadTravelAssistant` initializes `proposal_agent`, `GenericAgent._build_mcp_toolsets()` reads `config/mcp_config.json`, rewrites `"python"` to the active interpreter (`sys.executable`), injects `PYTHONPATH` pointing to the repository root, writes a resolved temporary config, and launches `src.ai_assistant.mcp_server.weroad_mcp` as a child process communicating over JSON-RPC `stdio`.
+- **Clean Stdout Guarantee**: `weroad_mcp.py` configures Python's `logging` handler to write exclusively to `sys.stderr`, ensuring log messages never corrupt MCP JSON-RPC frames on `stdout`.
+- **Automatic Reconnection**: If an MCP `stdio` pipe closes mid-session, `GenericAgent.run()` and `GenericAgent.run_stream()` catch `"Connection closed"`, rebuild the MCP toolset, and retry the stage automatically.
+
+---
+
+### 5. Real-Time Reasoning & Event Streaming (`agent.py`, `server.py`, `index.html`)
+
+- **Graph Node Iteration (`agent.iter()`)**: Instead of waiting for `agent.run()` to finish before sending output, `GenericAgent.run_stream()` steps through PydanticAI's execution graph node by node:
+  - When entering a `CallToolsNode`, it inspects `ModelResponse.parts`:
+    - `ThinkingPart` (emitted by OpenRouter reasoning models) and non-JSON `TextPart` thoughts are yielded immediately as `StreamStepType.REASONING` (`"Agent Reasoning"`).
+    - `ToolCallPart` invocations are translated by `format_tool_call_message()` into human-readable `StreamStepType.TOOL_CALL` events (e.g., *"Searching Flights: MXP → TYO"*).
+    - Calls to the structured output tool (`final_result`) emit a `"Synthesizing Final Proposal"` reasoning step.
+  - When entering a `ModelRequestNode`, any `ToolReturnPart` payloads are summarized by `format_tool_result_message()` into `StreamStepType.TOOL_RESULT` events (e.g., *"Found 3 round-trip flight options starting from €685"*).
+- **SSE Transport & Reactive Rendering**: `POST /api/v1/chat/stream` serializes each `AgentStreamEvent` as an SSE frame (`event: <step_type>\ndata: <json>\n\n`), which `index.html` consumes via `fetch()` + `ReadableStream` to update the collapsible **Agent Reasoning & Execution Stream** live.
+
+---
+
+### 6. Safety Guardrails & Token-Budget Handling (`guardrail.py`)
+
+- **Dual-Stage Moderation**: `LlamaGuardModerator` runs `check_input()` before Stage 1 and `check_output()` after Stage 2 using a dedicated `GenericAgent(stage_name="guardrail")`.
+- **Reasoning Router Compatibility**: Because `openrouter/free` can route requests to reasoning-enabled models that emit thinking tokens before outputting `safe` or `unsafe\nS<n>`, `LlamaGuardModerator` enforces a minimum `max_tokens` floor of `1024` for `openrouter:` models and automatically retries once at `max_tokens=2048` if a model hits its token limit during reasoning.
+- **Fail-Closed Default**: With `fail_open: false` in `config/config.yaml`, any unexpected moderation error blocks the request (`MODERATION_UNAVAILABLE`) rather than bypassing safety checks.
+
+---
+
+### 7. OpenTelemetry Observability & Correlation (`observability.py` & `grafana/`)
+
+- **Distributed Tracing (Tempo)**: `tracing_middleware` in `server.py` opens a root span (`HTTP POST /api/v1/chat/stream`) and attaches `X-Trace-Id` to the HTTP response headers. Child spans wrap `weroad.handle_query`, `agent.intent_extraction`, and `agent.proposal_synthesis.stream` with GenAI token and model attributes, exported via OTLP HTTP to Tempo (`:4318/v1/traces`).
+- **Trace-Correlated Logs (Loki)**: `TraceContextLogFilter` injects active `trace_id` and `span_id` into every `logging.LogRecord`, formatted as JSON and shipped via OTLP HTTP to Loki (`:3100/otlp/v1/logs`).
+- **Prometheus & Grafana Metrics**: `GenericAgent` records `weroad_llm_tokens` (`input`, `output`, `total`), `weroad_llm_requests`, `weroad_llm_request_duration_seconds`, and `weroad_guardrail_checks`, exposed at `GET /metrics` and pre-wired into `grafana/grafana-dashboard.json`.
+
+---
+
 ## Demo & Screenshots
 
-Sample captures and an exported interactive snapshot of the assistant in action are available in the [`demo-example/`](demo-example/) folder:
+A full video walkthrough, sample captures, and an exported interactive snapshot of the assistant in action are available in the [`demo-example/`](demo-example/) folder:
 
-### 1. Interactive Web UI & Live Reasoning Stream
+### 1. End-to-End Video Demo
+
+Watch the complete user journey—from entering a travel query and selecting a departure airport, to streaming live Llama Guard safety checks, model reasoning tokens, MCP tool calls, and rendered WeRoad tour & Skyscanner flight cards:
+
+- **Video Walkthrough:** [`demo-example/demo.mp4`](demo-example/demo.mp4)
+
+### 2. Interactive Web UI & Live Reasoning Stream
 
 The React + Tailwind CSS interface (`index.html`) streams safety guardrail checks, model reasoning tokens, parsed travel criteria, and MCP tool calls in real time alongside departure airport controls and starter prompts:
 
 ![WeRoad Agentic Travel Assistant Web UI](demo-example/webui.png)
 
-### 2. Travel Itinerary & Skyscanner Flight Proposal Output
+### 3. Travel Itinerary & Skyscanner Flight Proposal Output
 
 Once Stage 2 completes, the assistant renders structured WeRoad tour cards, live departure date tables (*turni*), EUR pricing, age cohorts, and matched Skyscanner round-trip flight options:
 
@@ -120,7 +232,7 @@ Once Stage 2 completes, the assistant renders structured WeRoad tour cards, live
 
 ![WeRoad.it - AI Trip & Flight Finder Output](demo-example/WeRoad.it%20-%20AI%20Trip%20&%20Flight%20Finder.png)
 
-### 3. Grafana LLM Performance & Observability Dashboard
+### 4. Grafana Observability Dashboard
 
 Every query emits distributed traces, structured logs, and Prometheus metrics visualized in the pre-provisioned Grafana dashboard (`grafana/grafana-dashboard.json`):
 
@@ -131,11 +243,12 @@ Every query emits distributed traces, structured logs, and Prometheus metrics vi
 ## Project Structure
 
 ```text
-Travel-AI-assistant/
+travel-AI-assistant/
 ├── config/
 │   ├── config.yaml                              # Centralized pipeline, OpenRouter reasoning, guardrail, scraper & OTel config
 │   └── mcp_config.json                          # MCP stdio server command definition ("weroad")
 ├── demo-example/
+│   ├── demo.mp4                                 # End-to-end video walkthrough of the travel assistant
 │   ├── grafana.png                              # Grafana observability dashboard screenshot
 │   ├── webui.png                                # Web UI & live reasoning stream screenshot
 │   ├── WeRoad.it - AI Trip & Flight Finder.html # Exported interactive HTML demo output
@@ -166,6 +279,7 @@ Travel-AI-assistant/
 ├── .env                                         # Local environment variables (OPENROUTER_API_KEY, RAPIDAPI_KEY, etc.)
 ├── .gitattributes                               # Git line-ending & diff attributes
 ├── .gitignore                                   # Git ignore rules
+├── .weroad_catalog_cache.json                   # Local 6-hour JSON cache of discovered WeRoad.it itinerary URLs
 ├── docker-compose.yaml                          # Docker Compose stack for Tempo, Loki, Prometheus & Grafana
 ├── index.html                                   # Reactive React 18 + Tailwind CSS frontend with live SSE step stream
 ├── pyproject.toml                               # Project metadata & dependencies (uv / pip)
@@ -184,7 +298,7 @@ Travel-AI-assistant/
 
 | Backend | `model_name` Format | Example Models | Required / Optional Env Vars | Supported Config Options |
 | :--- | :--- | :--- | :--- | :--- |
-| **OpenRouter** *(Default)* | `openrouter:<model_id>` | `openrouter:openrouter/free` (Free Models Router), `openrouter:nvidia/nemotron-3-nano-30b-a3b:free`, `openrouter:meta-llama/llama-guard-4-12b` | **Required:** `OPENROUTER_API_KEY`<br>*Optional:* `OPENROUTER_SITE_URL`, `OPENROUTER_APP_NAME` | `reasoning_enabled`, `reasoning_effort`, `reasoning_max_tokens`, `reasoning_exclude`, `base_url` |
+| **OpenRouter** *(Default)* | `openrouter:<model_id>` | `openrouter:openrouter/free` (Free Models Router), `openrouter:nvidia/nemotron-3-nano-30b-a3b:free`, `openrouter:meta-llama/llama-guard-4-12b` | **Required:** `OPENROUTER_API_KEY`<br>*Optional:* `OPENROUTER_SITE_URL` (or `HTTP_REFERER`), `OPENROUTER_APP_NAME` (or `X_TITLE`) | `reasoning_enabled`, `reasoning_effort`, `reasoning_max_tokens`, `reasoning_exclude`, `base_url` |
 | **Local Ollama** | `ollama:<model_tag>` | `ollama:qwen2.5:1.5b`, `ollama:qwen2.5:3b`, `ollama:llama3.2:3b` | *Optional:* `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`), `OLLAMA_NUM_CTX` (default `3072`) | `base_url`, `temperature`, `max_tokens` |
 | **Local Hugging Face `transformers`** | `transformers:<repo_id>` | `transformers:google/gemma-3-1b-it`, `transformers:Qwen/Qwen2.5-1.5B-Instruct` | *Optional:* `HF_TOKEN` (for gated repositories) | `device` (`"auto"`, `"cuda"`, `"mps"`, `"cpu"`), `torch_dtype` (`"auto"`, `"float16"`, `"bfloat16"`), `load_in_4bit` (`true`/`false`) |
 | **Hugging Face Inference Providers** | `huggingface:<repo_id>` | `huggingface:google/gemma-3-27b-it` | **Required:** `HF_TOKEN` | `provider` (e.g., `"hf-inference"`, `"together"`, `"fireworks-ai"`) |
@@ -237,8 +351,8 @@ All observability metrics (`weroad_llm_tokens`, `weroad_llm_requests`, `weroad_l
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd Travel-AI-assistant
+git clone https://github.com/95gas/travel-AI-assistant.git
+cd travel-AI-assistant
 ```
 
 ### 2. Obtain an OpenRouter API Key (Default Setup)
@@ -252,6 +366,8 @@ The default configuration (`config/config.yaml`) uses **OpenRouter's Free Models
 
 ### 3. Install Python Dependencies
 
+Requires **Python `>=3.11`** (`pyproject.toml`).
+
 #### Option A: Using `uv` (Recommended)
 
 ```bash
@@ -264,10 +380,12 @@ uv sync
 python -m venv .venv
 source .venv/bin/activate        # On Windows: .venv\Scripts\activate
 
-pip install "pydantic>=2.9.0" "pydantic-ai[openai]>=0.1.0" "mcp>=1.2.0" "httpx>=0.27.2" \
-  "beautifulsoup4>=4.12.3" pyyaml python-dotenv fastapi uvicorn \
-  opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http \
-  opentelemetry-exporter-prometheus prometheus-client
+pip install "pydantic>=2.9.0" "pydantic-ai>=0.1.0" "pydantic-ai-slim[huggingface]>=2.54.0" \
+  "mcp>=1.2.0" "fastmcp>=4.2.0" "httpx>=0.27.2" "beautifulsoup4>=4.12.3" \
+  pyyaml python-dotenv "fastapi>=0.163.1" uvicorn \
+  "transformers>=5.17.0" "torch>=2.15.0" "accelerate>=1.16.0" \
+  "opentelemetry-sdk>=1.44.0" "opentelemetry-exporter-otlp-proto-http>=1.44.0" \
+  "opentelemetry-exporter-prometheus>=0.65b0" "prometheus-client>=0.26.0"
 ```
 
 ---
@@ -276,13 +394,13 @@ pip install "pydantic>=2.9.0" "pydantic-ai[openai]>=0.1.0" "mcp>=1.2.0" "httpx>=
 
 ### 1. Environment Variables (`.env`)
 
-Create or update `.env` in the project root directory:
+Create or update `.env` in the project root directory (never commit real API keys to version control):
 
 ```env
 # Required for default OpenRouter Free Models Router (`openrouter:openrouter/free`)
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 
-# Optional OpenRouter app attribution headers
+# Optional OpenRouter app attribution headers (read by GenericAgent._resolve_model)
 OPENROUTER_SITE_URL=http://localhost:8000
 OPENROUTER_APP_NAME=WeRoad Travel Assistant
 
@@ -296,37 +414,86 @@ OPENAI_API_KEY=your_openai_api_key_here
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 OLLAMA_BASE_URL=http://localhost:11434/v1
+OLLAMA_NUM_CTX=3072
 HF_TOKEN=your_huggingface_token_here
+
+# Optional: OpenTelemetry endpoint/service overrides
+OTEL_SERVICE_NAME=weroad-travel-assistant
+OTEL_ENVIRONMENT=development
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:3100/otlp/v1/logs
 ```
 
 ### 2. Application Configuration (`config/config.yaml`)
 
 `ConfigManager` loads `config/config.yaml` at startup and validates it into `WeRoadAssistantConfig`:
 
-- **`pipeline`**:
-  - `llm_default`, `llm_intent`, `llm_proposal`: Configure `model_name` (default `"openrouter:openrouter/free"`), `temperature`, `max_tokens`, and OpenRouter unified reasoning settings per stage:
-    - `reasoning_enabled` (`true` / `false`): Enables or disables reasoning tokens.
-    - `reasoning_effort` (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`): Controls the reasoning depth (`"low"` for fast intent parsing, `"medium"` for multi-step tour & flight synthesis).
+- **`pipeline`**
+  - **LLM Stage Configurations** (`llm_default`, `llm_intent`, `llm_proposal`):
+    - `model_name`: Model identifier (defaults to `"openrouter:openrouter/free"`). Also supports:
+      - `"ollama:<model>"`
+      - `"transformers:<repo_id>"` (with `device`, `torch_dtype`, and `load_in_4bit`)
+      - `"huggingface:<repo_id>"`
+      - Native PydanticAI identifiers (`"openai:..."`, `"anthropic:..."`, `"google-gla:..."`, etc.)
+    - `temperature`: Sampling temperature (`0.2` for default/proposal, `0.0` for intent).
+    - `max_tokens`: Maximum generation token limit (`4096` for default/proposal, `1500` for intent).
+    - `reasoning_enabled` (`true` / `false`): Enables or disables OpenRouter unified reasoning tokens.
+    - `reasoning_effort` (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`): Controls reasoning depth (`"low"` for fast intent parsing, `"medium"` for multi-step tour & flight synthesis).
     - `reasoning_max_tokens` (optional `int`): Explicit reasoning token budget (mutually exclusive with `reasoning_effort`).
     - `reasoning_exclude` (optional `bool`): When `true`, reasons internally without returning reasoning text in the stream.
-  - Also supports `"ollama:<model>"`, `"transformers:<repo_id>"` (with `device`, `torch_dtype`, and `load_in_4bit`), `"huggingface:<repo_id>"`, and native PydanticAI identifiers (`"openai:..."`, `"anthropic:..."`, `"google-gla:..."`, etc.).
-  - `intent_request_limit` (`2`) and `proposal_request_limit` (`10`): Cap LLM/tool round-trips.
-  - `require_departure_airport` (`true`): Prompts the user for their origin airport when omitted.
-- **`llama_guard`**:
-  - `enabled`, `check_input`, `check_output`: Toggle input and output safety moderation.
-  - `model_name`: Defaults to `"openrouter:openrouter/free"` with `reasoning_enabled: false` so binary `safe`/`unsafe` checks return quickly within `max_tokens: 100` (can also be set to `"openrouter:meta-llama/llama-guard-4-12b"` or `"ollama:qwen2.5:1.5b"`).
+  - **Execution & Guardrail Settings**:
+    - `intent_request_limit`: Caps LLM/tool round-trips for intent extraction (default `4`).
+    - `proposal_request_limit`: Caps LLM/tool round-trips for proposal generation (default `25`).
+    - `tool_retries`: Caps structured output validation and tool retries (default `4`).
+    - `require_departure_airport`: Prompts the user for their origin airport when omitted (default `true`).
+
+- **`llama_guard`**
+  - `enabled`: Toggles content safety moderation (default `true`).
+  - `check_input`: Toggles input prompt safety checks (default `true`).
+  - `check_output`: Toggles assistant response safety checks (default `true`).
+  - `model_name`: Defaults to `"openrouter:openrouter/free"` with `reasoning_enabled: true` and `max_tokens: 1024` so reasoning-capable router models never truncate before emitting `'safe'`/`'unsafe'` (can also be set to `"openrouter:meta-llama/llama-guard-4-12b"` or `"ollama:qwen2.5:1.5b"` with `reasoning_enabled: false`).
   - `fail_open`: Defaults to `false` (blocks requests if the moderation service fails).
   - `category_map`: Maps safety codes `S1`–`S13` to human-readable descriptions.
-- **`scraper`**:
-  - `base_url`, `sitemap_url`, `cache_path` (`.weroad_catalog_cache.json`), `cache_ttl_seconds` (`21600`), `timeout_seconds`, and `max_concurrent_requests`.
-- **`flight_search`**:
-  - `enabled`, `provider` (`"skyscanner"`), `currency` (`"EUR"`), `market` (`"IT"`), `locale` (`"it-IT"`), `skyscanner_base_url` (`https://www.skyscanner.it/trasporti/voli`), and `rapidapi_host`.
-- **`server`**:
-  - `host` (`"0.0.0.0"`), `port` (`"8000"`), `api_base_url`, and `cors_origins`.
-- **`observability`**:
-  - `enabled`, `service_name`, OTLP endpoints for Tempo (`4318`) and Loki (`3100`), `grafana_base_url`, `capture_prompts`, and `json_logs`.
-- **`schemas`**:
-  - `mcp_config_path`: Defaults to `"config/mcp_config.json"`.
+
+- **`scraper`**
+  - `base_url`: Base WeRoad URL (`"https://www.weroad.it"`).
+  - `sitemap_url`: XML sitemap URL (`"https://www.weroad.it/sitemap.xml"`).
+  - `cache_path`: Local catalog cache file path (`".weroad_catalog_cache.json"`).
+  - `cache_ttl_seconds`: Cache expiration duration in seconds (`21600`).
+  - `timeout_seconds`: HTTP request timeout in seconds (`20.0`).
+  - `max_concurrent_requests`: Maximum parallel scraping requests (`5`).
+
+- **`flight_search`**
+  - `enabled`: Toggles flight search integration (default `true`).
+  - `provider`: Flight search backend provider (`"skyscanner"`).
+  - `currency`: Pricing currency (`"EUR"`).
+  - `market`: Market country code (`"IT"`).
+  - `locale`: Locale string (`"it-IT"`).
+  - `skyscanner_base_url`: Base Skyscanner URL (`"https://www.skyscanner.it/trasporti/voli"`).
+  - `rapidapi_host`: RapidAPI endpoint host (`"sky-scrapper.p.rapidapi.com"`).
+  - `timeout_seconds`: API request timeout in seconds (`20.0`).
+  - `max_results_per_date`: Maximum flight options returned per departure date (`3`).
+
+- **`server`**
+  - `host`: Server bind address (`"0.0.0.0"`).
+  - `port`: Server listening port (`8000`).
+  - `api_base_url`: Public/local API base URL (`"http://localhost:8000"`).
+  - `cors_origins`: List of allowed Cross-Origin Resource Sharing (CORS) origins.
+
+- **`observability`**
+  - `enabled`: Toggles OpenTelemetry instrumentation (default `true`).
+  - `service_name`: Service identifier (`"weroad-travel-assistant"`).
+  - `environment`: Deployment environment name (`"development"`).
+  - `otlp_traces_endpoint`: OTLP endpoint for Tempo traces (`"http://localhost:4318/v1/traces"`).
+  - `otlp_logs_endpoint`: OTLP endpoint for Loki logs (`"http://localhost:3100/otlp/v1/logs"`).
+  - `otlp_metrics_endpoint`: OTLP endpoint for metrics (`"http://localhost:4318/v1/metrics"`).
+  - `grafana_base_url`: Base URL for Grafana dashboards (`"http://localhost:3000"`).
+  - `capture_prompts`: Enables capturing prompts in telemetry spans/logs (`true`).
+  - `json_logs`: Outputs structured JSON logs (`true`).
+  - `log_level`: Logging verbosity level (`"INFO"`).
+
+- **`schemas`**
+  - `mcp_config_path`: Path to the MCP server configuration file (defaults to `"config/mcp_config.json"`).
 
 ---
 
@@ -343,7 +510,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 Open **`http://localhost:8000`** (or **`http://localhost:8000/ui`**) in your browser to launch the React + Tailwind CSS web application, where you can:
 - Watch the live collapsible **Agent Reasoning & Execution Stream** as the assistant checks safety policies, streams model reasoning tokens, parses your travel intent, searches WeRoad tours, verifies departure dates (*turni*), and looks up Skyscanner flights
 - Pre-select a default departure airport (`MXP`, `LIN`, `BGY`, `FCO`, `VCE`, `BLQ`, `NAP`, etc.) or type a custom airport/IATA code from the top navigation bar
-- Launch starter prompts or chat naturally in English or Italian
+- Launch starter prompts or chat naturally in multiple languages (English, Italian, Spanish, French, German, Portuguese, and more)—the assistant automatically detects your language and replies in kind
 - Browse interactive WeRoad tour cards, live departure date tables, Skyscanner round-trip flight links, and per-run token telemetry
 
 Available HTTP endpoints:
@@ -381,10 +548,10 @@ curl -X POST http://localhost:8000/api/v1/chat \
 
 ### 2. Running the MCP Server Standalone
 
-To inspect or test the MCP tool server directly (e.g., with MCP Inspector):
+To inspect or test the MCP tool server directly (matching `config/mcp_config.json`):
 
 ```bash
-PYTHONPATH=src python -m ai_assistant.mcp_server.weroad_mcp
+python -m src.ai_assistant.mcp_server.weroad_mcp
 ```
 
 *Note: `weroad_mcp.py` routes all application logs strictly to `stderr` so the `stdout` JSON-RPC stream remains clean for MCP clients.*
@@ -397,6 +564,7 @@ PYTHONPATH=src python -m ai_assistant.mcp_server.weroad_mcp
    ```bash
    docker-compose up -d
    ```
+   *(Linux users: `grafana/prometheus.yaml` scrapes `host.docker.internal:8000`. If running Docker Engine on Linux rather than Docker Desktop, add `extra_hosts: ["host.docker.internal:host-gateway"]` under the `prometheus` service in `docker-compose.yaml`.)*
 2. **Access the dashboards**:
    - **Grafana**: `http://localhost:3000` (auto-provisioned with `grafana/grafana-datasources.yaml`, `grafana/grafana-dashboards.yaml`, and `grafana/grafana-dashboard.json` — see preview in [`demo-example/grafana.png`](demo-example/grafana.png))
    - **Prometheus**: `http://localhost:9090` (configured via `grafana/prometheus.yaml`)

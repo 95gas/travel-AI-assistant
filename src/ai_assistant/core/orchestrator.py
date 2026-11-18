@@ -36,6 +36,34 @@ from src.ai_assistant.observability.observability import build_token_usage_summa
 logger = logging.getLogger("WeRoadOrchestrator")
 _tracer = get_tracer("weroad.orchestrator")
 
+_LOCALIZED_MISSING_AIRPORT_MESSAGES: Dict[str, str] = {
+    "it": (
+        "Specifica da quale aeroporto vorresti partire (ad esempio Milano Malpensa MXP, "
+        "Roma Fiumicino FCO, Venezia VCE, Bologna BLQ o Napoli NAP) così posso verificare "
+        "le date disponibili dei tour WeRoad e i relativi voli di andata e ritorno su Skyscanner."
+    ),
+    "es": (
+        "Por favor, indica desde qué aeropuerto te gustaría salir (por ejemplo, Madrid MAD, "
+        "Barcelona BCN, Milán Malpensa MXP o Roma Fiumicino FCO) para poder comprobar las fechas "
+        "disponibles de los tours de WeRoad y los vuelos de ida y vuelta en Skyscanner."
+    ),
+    "fr": (
+        "Veuillez indiquer votre aéroport de départ (par exemple Paris CDG, Lyon LYS, "
+        "Milan Malpensa MXP ou Rome Fiumicino FCO) afin que je puisse vérifier les dates "
+        "disponibles des circuits WeRoad et les vols aller-retour sur Skyscanner."
+    ),
+    "de": (
+        "Bitte gib an, von welchem Flughafen du abfliegen möchtest (z. B. Frankfurt FRA, "
+        "München MUC, Mailand Malpensa MXP oder Rom Fiumicino FCO), damit ich verfügbare "
+        "WeRoad-Reisetermine und passende Hin- und Rückflüge auf Skyscanner prüfen kann."
+    ),
+    "pt": (
+        "Por favor, informa de qual aeroporto gostarias de partir (por exemplo, Lisboa LIS, "
+        "Porto OPO, Milão Malpensa MXP ou Roma Fiumicino FCO) para que eu possa verificar as "
+        "datas disponíveis dos roteiros WeRoad e os voos de ida e volta no Skyscanner."
+    ),
+}
+
 
 class WeRoadTravelAssistant:
     """Two-stage PydanticAI travel assistant with centralized config, I/O guardrails, and live step streaming."""
@@ -96,6 +124,17 @@ class WeRoadTravelAssistant:
             stage_name="proposal_synthesis",
         )
 
+    def _resolve_missing_airport_message(self, intent: TravelSearchIntent) -> str:
+        """Returns a departure-airport prompt matching the user's detected input language."""
+        if intent.missing_airport_reply and intent.missing_airport_reply.strip():
+            return intent.missing_airport_reply.strip()
+
+        lang_code = (intent.user_language or "").strip().lower()[:2]
+        if lang_code in _LOCALIZED_MISSING_AIRPORT_MESSAGES:
+            return _LOCALIZED_MISSING_AIRPORT_MESSAGES[lang_code]
+
+        return self.config_manager.prompts_config.missing_departure_airport_message.strip()
+
     @staticmethod
     def _serialize_proposal_for_moderation(proposal: TravelProposalResponse) -> str:
         """Builds a plain-text representation of the final response for output moderation."""
@@ -122,6 +161,8 @@ class WeRoadTravelAssistant:
     def _summarize_intent_reasoning(intent: TravelSearchIntent) -> str:
         """Formats extracted `TravelSearchIntent` fields into a clear intermediate reasoning explanation."""
         parts = [f"Destination: **{intent.destination}**"]
+        if intent.user_language:
+            parts.append(f"Language: `{intent.user_language}`")
         if intent.destination_slug_keywords:
             parts.append(f"WeRoad keywords: `{', '.join(intent.destination_slug_keywords)}`")
 
@@ -239,6 +280,7 @@ class WeRoadTravelAssistant:
 
             if root_span is not None and hasattr(root_span, "set_attribute"):
                 root_span.set_attribute("weroad.intent.destination", intent.destination)
+                root_span.set_attribute("weroad.intent.user_language", intent.user_language)
                 if intent.departure_airport_iata:
                     root_span.set_attribute("weroad.intent.origin_iata", intent.departure_airport_iata)
 
@@ -249,6 +291,7 @@ class WeRoadTravelAssistant:
                 detail=self._summarize_intent_reasoning(intent),
                 metadata={
                     "destination": intent.destination,
+                    "user_language": intent.user_language,
                     "origin_iata": intent.departure_airport_iata,
                     "destination_iata": intent.destination_airport_iata,
                 },
@@ -267,7 +310,7 @@ class WeRoadTravelAssistant:
                     title="Departure Airport Needed",
                     detail="No departure airport was detected in the query—asking user for an origin airport so round-trip Skyscanner flights can be matched.",
                 )
-                missing_msg = self.config_manager.prompts_config.missing_departure_airport_message.strip()
+                missing_msg = self._resolve_missing_airport_message(intent)
                 output_safety = await self.guardrail.check_output(user_query, missing_msg)
                 if self.guardrail.last_output_usage:
                     stage_usages["guardrail_output"] = self.guardrail.last_output_usage
