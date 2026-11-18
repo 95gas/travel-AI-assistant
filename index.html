@@ -1,0 +1,1089 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WeRoad.it — AI Trip &amp; Flight Finder</title>
+
+  <!-- Google Fonts: Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'monospace'],
+          },
+          colors: {
+            weroad: {
+              red: '#FF4758',
+              darkRed: '#D80027',
+              ink: '#1A1A1A',
+              muted: '#666670',
+              surface: '#F7F7F9',
+              border: '#EBEBF0',
+            },
+          },
+          boxShadow: {
+            'soft': '0 4px 20px rgba(26, 26, 26, 0.05)',
+            'pill': '0 8px 28px rgba(26, 26, 26, 0.08)',
+            'red-glow': '0 6px 18px rgba(255, 71, 88, 0.25)',
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- React 18 & Babel Standalone -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body {
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #1A1A1A;
+      background-color: #FFFFFF;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    @keyframes pulseRing {
+      0% { transform: scale(0.85); opacity: 0.8; }
+      70% { transform: scale(1.6); opacity: 0; }
+      100% { transform: scale(1.6); opacity: 0; }
+    }
+
+    .animate-pulse-ring {
+      animation: pulseRing 1.6s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+    }
+
+    @keyframes fadeSlideIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .step-enter {
+      animation: fadeSlideIn 0.22s ease-out forwards;
+    }
+
+    /* Subtle custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #DCDCE2;
+      border-radius: 999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #B8B8C2;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col bg-white text-weroad-ink">
+  <div id="root" class="flex-1 flex flex-col"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // Resolve API base URL automatically whether served by FastAPI or opened directly
+    const API_BASE_URL = (() => {
+      if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        if (window.location.port === '8000' || window.location.pathname.startsWith('/ui')) {
+          return window.location.origin;
+        }
+      }
+      return 'http://localhost:8000';
+    })();
+
+    const STARTER_PROMPTS = [
+      {
+        tag: '🇯🇵 Asia · 10 Days',
+        title: 'Japan in October from Milan',
+        prompt: "I want to visit Japan in October for 10 days leaving from Milan Malpensa. I'm 29.",
+      },
+      {
+        tag: '🇮🇸 Europe · August',
+        title: 'Islanda ad agosto da Roma',
+        prompt: 'Cerco un viaggio WeRoad in Islanda ad agosto da Roma Fiumicino',
+      },
+      {
+        tag: '🇲🇦 Adventure · Under €900',
+        title: 'Morocco in November from Bologna',
+        prompt: 'Morocco in November for 8 days under €900 from Bologna',
+      },
+      {
+        tag: '🇵🇪 South America · 12 Days',
+        title: 'Peru expedition in September',
+        prompt: 'Peru in September for 12 days',
+      },
+    ];
+
+    // -----------------------------------------------------------------------
+    // Inline Crisp SVG Icons
+    // -----------------------------------------------------------------------
+    const Icon = ({ name, className = 'w-4 h-4' }) => {
+      const icons = {
+        plane: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z" />
+          </svg>
+        ),
+        compass: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
+          </svg>
+        ),
+        brain: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+            <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+            <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+          </svg>
+        ),
+        shield: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+            <path d="m9 12 2 2 4-4" />
+          </svg>
+        ),
+        calendar: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M8 2v4" />
+            <path d="M16 2v4" />
+            <rect width="18" height="18" x="3" y="4" rx="2" />
+            <path d="M3 10h18" />
+          </svg>
+        ),
+        search: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+        ),
+        check: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 6 9 17l-5-5" />
+          </svg>
+        ),
+        chevronDown: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        ),
+        external: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 3h6v6" />
+            <path d="M10 14 21 3" />
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+          </svg>
+        ),
+        send: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="m22 2-7 20-4-9-9-4Z" />
+            <path d="M22 2 11 13" />
+          </svg>
+        ),
+        rotate: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+          </svg>
+        ),
+        sparkles: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+          </svg>
+        ),
+        alert: (
+          <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" x2="12" y1="8" y2="12" />
+            <line x1="12" x2="12.01" y1="16" y2="16" />
+          </svg>
+        ),
+      };
+      return icons[name] || null;
+    };
+
+    // -----------------------------------------------------------------------
+    // Simple Safe Markdown Formatter (Bold, Inline Code, Links, Bullet Lists)
+    // -----------------------------------------------------------------------
+    function FormattedText({ text }) {
+      if (!text) return null;
+      const lines = text.split('\n');
+
+      const renderInline = (str) => {
+        const parts = [];
+        let remaining = str;
+        let keyIdx = 0;
+
+        const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)]+\))/;
+        while (remaining.length > 0) {
+          const match = remaining.match(tokenRegex);
+          if (!match) {
+            parts.push(<span key={keyIdx++}>{remaining}</span>);
+            break;
+          }
+          if (match.index > 0) {
+            parts.push(<span key={keyIdx++}>{remaining.slice(0, match.index)}</span>);
+          }
+          const token = match[0];
+          if (token.startsWith('**') && token.endsWith('**')) {
+            parts.push(
+              <strong key={keyIdx++} className="font-bold text-weroad-ink">
+                {token.slice(2, -2)}
+              </strong>
+            );
+          } else if (token.startsWith('`') && token.endsWith('`')) {
+            parts.push(
+              <code
+                key={keyIdx++}
+                className="font-mono text-xs bg-white border border-weroad-border text-weroad-red px-1.5 py-0.5 rounded"
+              >
+                {token.slice(1, -1)}
+              </code>
+            );
+          } else if (token.startsWith('[')) {
+            const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
+            if (linkMatch) {
+              parts.push(
+                <a
+                  key={keyIdx++}
+                  href={linkMatch[2]}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-weroad-red font-semibold underline hover:text-weroad-darkRed"
+                >
+                  {linkMatch[1]}
+                </a>
+              );
+            } else {
+              parts.push(<span key={keyIdx++}>{token}</span>);
+            }
+          }
+          remaining = remaining.slice(match.index + token.length);
+        }
+        return parts;
+      };
+
+      return (
+        <div className="space-y-1.5 text-[15px] leading-relaxed text-weroad-ink">
+          {lines.map((line, i) => {
+            const trimmed = line.trim();
+            if (!trimmed) return <div key={i} className="h-1" />;
+            if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+              return (
+                <div key={i} className="flex items-start gap-2 pl-1">
+                  <span className="text-weroad-red font-bold mt-0.5">•</span>
+                  <span>{renderInline(trimmed.slice(2))}</span>
+                </div>
+              );
+            }
+            return <p key={i}>{renderInline(line)}</p>;
+          })}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-Time Agent Reasoning & Step Stream Timeline Component
+    // -----------------------------------------------------------------------
+    function AgentReasoningTimeline({ steps, isStreaming }) {
+      const [expanded, setExpanded] = useState(true);
+
+      // Keep expanded while streaming; allow user to toggle anytime
+      useEffect(() => {
+        if (isStreaming) {
+          setExpanded(true);
+        }
+      }, [isStreaming]);
+
+      if (!steps || steps.length === 0) return null;
+
+      const latestStep = steps[steps.length - 1];
+      const toolCallsCount = steps.filter((s) => s.step_type === 'tool_call').length;
+      const flightSearchesCount = steps.filter(
+        (s) => s.step_type === 'tool_call' && (s.tool_name || '').toLowerCase().includes('flight')
+      ).length;
+
+      const firstTs = steps[0]?.timestamp_ms;
+      const lastTs = latestStep?.timestamp_ms;
+      const durationSec =
+        firstTs && lastTs && lastTs >= firstTs ? ((lastTs - firstTs) / 1000).toFixed(1) : null;
+
+      const getStepVisuals = (step) => {
+        const tName = (step.tool_name || '').toLowerCase();
+        if (step.step_type === 'tool_call') {
+          if (tName.includes('flight')) {
+            return {
+              icon: 'plane',
+              badge: 'Skyscanner',
+              bg: 'bg-sky-50 border-sky-200 text-sky-700',
+              dot: 'bg-sky-500',
+            };
+          }
+          if (tName.includes('departure')) {
+            return {
+              icon: 'calendar',
+              badge: 'Turni / Dates',
+              bg: 'bg-amber-50 border-amber-200 text-amber-800',
+              dot: 'bg-amber-500',
+            };
+          }
+          return {
+            icon: 'compass',
+            badge: 'WeRoad Catalog',
+            bg: 'bg-rose-50 border-rose-200 text-weroad-red',
+            dot: 'bg-weroad-red',
+          };
+        }
+        if (step.step_type === 'tool_result') {
+          return {
+            icon: 'check',
+            badge: 'Result',
+            bg: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+            dot: 'bg-emerald-500',
+          };
+        }
+        if (step.step_type === 'reasoning') {
+          return {
+            icon: 'brain',
+            badge: 'Reasoning',
+            bg: 'bg-violet-50 border-violet-200 text-violet-700',
+            dot: 'bg-violet-500',
+          };
+        }
+        if (step.stage && step.stage.includes('guardrail')) {
+          return {
+            icon: 'shield',
+            badge: 'Guardrail',
+            bg: 'bg-slate-100 border-slate-200 text-slate-700',
+            dot: 'bg-slate-500',
+          };
+        }
+        return {
+          icon: 'sparkles',
+          badge: 'Step',
+          bg: 'bg-gray-100 border-gray-200 text-gray-700',
+          dot: 'bg-gray-400',
+        };
+      };
+
+      return (
+        <div className="mb-3 rounded-2xl border border-weroad-border bg-white shadow-sm overflow-hidden">
+          {/* Header Toggle Bar */}
+          <button
+            type="button"
+            onClick={() => setExpanded((prev) => !prev)}
+            className="w-full flex items-center justify-between gap-3 px-4 py-2.5 bg-gradient-to-r from-[#FAFAFC] to-white hover:bg-gray-50 transition-colors text-left"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              {isStreaming ? (
+                <span className="relative flex h-2.5 w-2.5 shrink-0">
+                  <span className="animate-pulse-ring absolute inline-flex h-full w-full rounded-full bg-weroad-red opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-weroad-red"></span>
+                </span>
+              ) : (
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-600 border border-emerald-200">
+                  <Icon name="check" className="w-3 h-3" />
+                </span>
+              )}
+
+              <div className="truncate">
+                <span className="text-xs font-bold text-weroad-ink">
+                  {isStreaming ? latestStep.title : 'Agent Reasoning & Execution Stream'}
+                </span>
+                <span className="ml-2 text-xs text-weroad-muted hidden sm:inline">
+                  {isStreaming
+                    ? latestStep.detail
+                    : `${steps.length} steps${toolCallsCount ? ` · ${toolCallsCount} tool calls` : ''}${
+                        flightSearchesCount ? ` · ${flightSearchesCount} flight lookup${flightSearchesCount > 1 ? 's' : ''}` : ''
+                      }${durationSec ? ` · ${durationSec}s` : ''}`}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {isStreaming && (
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-weroad-red bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-full">
+                  Live
+                </span>
+              )}
+              <span
+                className={`text-weroad-muted transition-transform duration-200 ${
+                  expanded ? 'rotate-180' : ''
+                }`}
+              >
+                <Icon name="chevronDown" className="w-4 h-4" />
+              </span>
+            </div>
+          </button>
+
+          {/* Collapsible Step-by-Step Timeline Body */}
+          {expanded && (
+            <div className="px-4 py-3 border-t border-weroad-border bg-[#FCFCFD] max-h-80 overflow-y-auto space-y-2.5">
+              {steps.map((step, idx) => {
+                const visuals = getStepVisuals(step);
+                const isLastActive = isStreaming && idx === steps.length - 1;
+                const isSubResult = step.step_type === 'tool_result';
+
+                return (
+                  <div
+                    key={step.event_id || idx}
+                    className={`step-enter flex items-start gap-2.5 ${isSubResult ? 'pl-5' : ''}`}
+                  >
+                    <div
+                      className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border ${visuals.bg}`}
+                    >
+                      <Icon name={visuals.icon} className="w-3.5 h-3.5" />
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-xs font-bold text-weroad-ink">{step.title}</span>
+                        <span
+                          className={`text-[10px] font-semibold px-1.5 py-0.2 rounded border ${visuals.bg}`}
+                        >
+                          {visuals.badge}
+                        </span>
+                        {isLastActive && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-medium text-weroad-red">
+                            <span className="w-1.5 h-1.5 rounded-full bg-weroad-red animate-ping" />
+                            in progress
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 text-xs text-weroad-muted leading-relaxed">
+                        <FormattedText text={step.detail} />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Departure Status Pill Helper
+    // -----------------------------------------------------------------------
+    function StatusBadge({ status }) {
+      const normalized = (status || 'Disponibile').toLowerCase();
+      let cls = 'bg-sky-50 text-sky-700 border-sky-200';
+      if (normalized.includes('confermato')) {
+        cls = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+      } else if (normalized.includes('quasi pieno')) {
+        cls = 'bg-amber-50 text-amber-800 border-amber-200';
+      } else if (normalized.includes('sold out')) {
+        cls = 'bg-rose-50 text-rose-700 border-rose-200';
+      }
+      return (
+        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border ${cls}`}>
+          {status || 'Disponibile'}
+        </span>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured Travel Proposal Cards (WeRoad Tours + Skyscanner Flights)
+    // -----------------------------------------------------------------------
+    function TravelProposalView({ payload }) {
+      const [showTelemetry, setShowTelemetry] = useState(false);
+
+      if (!payload) return null;
+
+      if (payload.guardrail_blocked) {
+        const violations = (payload.guardrail_violations || []).join(', ');
+        return (
+          <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-rose-900">
+            <div className="flex items-center gap-2 font-bold text-sm mb-1">
+              <Icon name="alert" className="w-4 h-4 text-rose-600" />
+              <span>Safety Guardrail Triggered {violations ? `(${violations})` : ''}</span>
+            </div>
+            <p className="text-sm">{payload.assistant_message}</p>
+          </div>
+        );
+      }
+
+      if (payload.needs_departure_airport) {
+        return (
+          <div className="rounded-2xl border border-sky-200 bg-sky-50/80 p-4 text-sky-950 flex items-start gap-3">
+            <div className="p-2 rounded-xl bg-sky-100 text-sky-700 shrink-0 mt-0.5">
+              <Icon name="plane" className="w-4 h-4" />
+            </div>
+            <div className="text-sm leading-relaxed">
+              <p className="font-bold text-sky-900 mb-1">Departure Airport Needed</p>
+              <FormattedText text={payload.assistant_message} />
+            </div>
+          </div>
+        );
+      }
+
+      const proposals = payload.proposals || [];
+      const telemetry = payload.telemetry;
+
+      return (
+        <div className="space-y-4">
+          {/* Main Narrative Summary */}
+          <FormattedText text={payload.assistant_message} />
+
+          {/* Recommended WeRoad Itineraries */}
+          {proposals.length > 0 && (
+            <div className="space-y-3 pt-1">
+              <h4 className="text-xs font-extrabold uppercase tracking-wider text-weroad-muted">
+                Recommended WeRoad Itineraries &amp; Skyscanner Flights ({proposals.length})
+              </h4>
+
+              {proposals.map((tour, idx) => (
+                <div
+                  key={idx}
+                  className="rounded-2xl border border-weroad-border bg-white shadow-soft overflow-hidden transition-all hover:border-rose-200"
+                >
+                  {/* Card Top Header */}
+                  <div className="p-4 sm:p-5 border-b border-weroad-border bg-gradient-to-r from-white to-[#FAFAFC]">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                          <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-weroad-red text-white text-xs font-extrabold">
+                            {idx + 1}
+                          </span>
+                          {tour.duration_days && (
+                            <span className="text-xs font-semibold bg-weroad-surface border border-weroad-border text-weroad-ink px-2.5 py-0.5 rounded-full">
+                              {tour.duration_days} days
+                            </span>
+                          )}
+                          {tour.starting_price_eur != null && (
+                            <span className="text-xs font-bold bg-rose-50 border border-rose-200 text-weroad-red px-2.5 py-0.5 rounded-full">
+                              from €{Number(tour.starting_price_eur).toLocaleString('en-US', { minimumFractionDigits: 0 })}
+                            </span>
+                          )}
+                        </div>
+                        <h3 className="text-base sm:text-lg font-extrabold text-weroad-ink tracking-tight">
+                          {tour.tour_title}
+                        </h3>
+                      </div>
+
+                      {tour.tour_url && (
+                        <a
+                          href={tour.tour_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center justify-center gap-1.5 rounded-full bg-weroad-red hover:bg-weroad-darkRed text-white font-bold text-xs px-4 py-2.5 shadow-red-glow transition-all shrink-0"
+                        >
+                          <span>View Tour</span>
+                          <Icon name="external" className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                    </div>
+
+                    {tour.why_it_fits && (
+                      <p className="mt-2.5 text-sm text-weroad-muted leading-relaxed">
+                        <strong className="text-weroad-ink font-semibold">Why it fits:</strong> {tour.why_it_fits}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Available Departure Dates ('Turni') */}
+                  {tour.matching_dates && tour.matching_dates.length > 0 && (
+                    <div className="p-4 sm:px-5 border-b border-weroad-border">
+                      <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-weroad-muted mb-2.5">
+                        <Icon name="calendar" className="w-3.5 h-3.5 text-weroad-red" />
+                        <span>Available Departure Dates</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-sm">
+                          <thead>
+                            <tr className="border-b border-weroad-border text-[11px] font-bold uppercase text-weroad-muted">
+                              <th className="py-2 pr-3">Dates</th>
+                              <th className="py-2 px-3">Price</th>
+                              <th className="py-2 px-3">Status</th>
+                              <th className="py-2 pl-3">Age Cohort</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-weroad-border/60">
+                            {tour.matching_dates.map((slot, sIdx) => (
+                              <tr key={sIdx} className="hover:bg-weroad-surface/60">
+                                <td className="py-2.5 pr-3 font-semibold text-weroad-ink whitespace-nowrap">
+                                  {slot.start_date} → {slot.end_date}
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <span className="font-extrabold text-weroad-ink">
+                                    €{Number(slot.price_eur).toLocaleString('en-US', { minimumFractionDigits: 0 })}
+                                  </span>
+                                  {slot.original_price_eur && (
+                                    <span className="ml-1.5 text-xs line-through text-weroad-muted">
+                                      €{Number(slot.original_price_eur).toLocaleString('en-US', { minimumFractionDigits: 0 })}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <StatusBadge status={slot.status} />
+                                </td>
+                                <td className="py-2.5 pl-3 text-xs font-medium text-weroad-muted whitespace-nowrap">
+                                  {slot.age_bracket || 'Tutti'}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Matching Skyscanner Round-Trip Flights */}
+                  {tour.matching_flights && tour.matching_flights.length > 0 && (
+                    <div className="p-4 sm:px-5 bg-[#FAFAFC]">
+                      <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-weroad-muted mb-2.5">
+                        <Icon name="plane" className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Round-Trip Flights (Skyscanner)</span>
+                      </div>
+                      <div className="space-y-2">
+                        {tour.matching_flights.map((flight, fIdx) => {
+                          const stopsLabel =
+                            flight.stops === 0
+                              ? 'Direct'
+                              : flight.stops != null
+                              ? `${flight.stops} stop${flight.stops > 1 ? 's' : ''}`
+                              : null;
+
+                          return (
+                            <div
+                              key={fIdx}
+                              className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-xl border border-weroad-border bg-white p-3"
+                            >
+                              <div className="space-y-0.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-extrabold text-sm text-weroad-ink">
+                                    {flight.origin_airport} → {flight.destination_airport}
+                                  </span>
+                                  <span className="text-xs text-weroad-muted">
+                                    {flight.departure_date} – {flight.return_date}
+                                  </span>
+                                </div>
+                                <div className="flex flex-wrap items-center gap-2 text-xs text-weroad-muted">
+                                  <span>{flight.airline || 'Skyscanner'}</span>
+                                  {flight.duration && <span>· ⏱ {flight.duration}</span>}
+                                  {stopsLabel && <span>· {stopsLabel}</span>}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between sm:justify-end gap-3">
+                                <div className="text-left sm:text-right">
+                                  {flight.price_eur != null ? (
+                                    <div className="font-extrabold text-sm text-weroad-ink">
+                                      €{Number(flight.price_eur).toLocaleString('en-US', { minimumFractionDigits: 0 })}
+                                      {flight.is_estimated_price && (
+                                        <span className="ml-1 text-[11px] font-normal text-weroad-muted">
+                                          (est.)
+                                        </span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <div className="text-xs font-semibold text-weroad-muted">Live fare</div>
+                                  )}
+                                  <div className="text-[11px] text-weroad-muted">round-trip</div>
+                                </div>
+
+                                {flight.booking_url && (
+                                  <a
+                                    href={flight.booking_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 rounded-full border border-weroad-border hover:border-weroad-red text-weroad-ink hover:text-weroad-red bg-white hover:bg-rose-50 font-bold text-xs px-3.5 py-2 transition-colors"
+                                  >
+                                    <span>Flights</span>
+                                    <Icon name="external" className="w-3 h-3" />
+                                  </a>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Alternative Suggestions */}
+          {payload.alternative_suggestions && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 text-xs sm:text-sm text-amber-950">
+              <strong className="font-bold">Travel Tip:</strong> {payload.alternative_suggestions}
+            </div>
+          )}
+
+          {/* Optional Telemetry Footer */}
+          {telemetry && (telemetry.total_tokens > 0 || telemetry.trace_id) && (
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={() => setShowTelemetry((prev) => !prev)}
+                className="text-[11px] font-medium text-weroad-muted hover:text-weroad-ink flex items-center gap-1"
+              >
+                <span>
+                  {showTelemetry ? 'Hide' : 'Show'} run metrics ({telemetry.total_tokens?.toLocaleString() || 0} tokens ·{' '}
+                  {telemetry.llm_requests || 0} LLM calls)
+                </span>
+                <Icon name="chevronDown" className={`w-3 h-3 transition-transform ${showTelemetry ? 'rotate-180' : ''}`} />
+              </button>
+              {showTelemetry && (
+                <div className="mt-2 rounded-xl border border-weroad-border bg-white p-3 text-xs text-weroad-muted flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    Input: <strong className="text-weroad-ink">{telemetry.input_tokens?.toLocaleString()}</strong> · Output:{' '}
+                    <strong className="text-weroad-ink">{telemetry.output_tokens?.toLocaleString()}</strong> · Total:{' '}
+                    <strong className="text-weroad-ink">{telemetry.total_tokens?.toLocaleString()}</strong>
+                  </div>
+                  {telemetry.trace_id && (
+                    <div className="font-mono text-[11px]">
+                      Trace: {telemetry.trace_id}
+                      {telemetry.grafana_trace_url && (
+                        <a
+                          href={telemetry.grafana_trace_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="ml-2 text-weroad-red underline font-sans font-semibold"
+                        >
+                          Tempo ↗
+                        </a>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Main Application Component
+    // -----------------------------------------------------------------------
+    function App() {
+      const [sessionId, setSessionId] = useState(() => crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+      const [messages, setMessages] = useState([]);
+      const [inputValue, setInputValue] = useState('');
+      const [isStreaming, setIsStreaming] = useState(false);
+      const [pendingQuery, setPendingQuery] = useState(null);
+
+      const bottomRef = useRef(null);
+
+      // Auto-scroll smoothly as stream events arrive
+      useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, [messages]);
+
+      const handleNewChat = () => {
+        if (isStreaming) return;
+        setMessages([]);
+        setPendingQuery(null);
+        setInputValue('');
+        setSessionId(crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+      };
+
+      const sendMessage = async (rawText) => {
+        const trimmed = (rawText || '').trim();
+        if (!trimmed || isStreaming) return;
+
+        setInputValue('');
+        setIsStreaming(true);
+
+        const userMsgId = `u_${Date.now()}`;
+        const assistantMsgId = `a_${Date.now() + 1}`;
+
+        // Combine with pending query if user is replying with their departure airport
+        let effectiveQuery = trimmed;
+        if (pendingQuery) {
+          effectiveQuery = `${pendingQuery} (departing from ${trimmed})`;
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          { id: userMsgId, role: 'user', content: trimmed },
+          {
+            id: assistantMsgId,
+            role: 'assistant',
+            steps: [],
+            isStreaming: true,
+            payload: null,
+            error: null,
+          },
+        ]);
+
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/v1/chat/stream`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream',
+            },
+            body: JSON.stringify({
+              query: effectiveQuery,
+              departure_airport: null,
+              session_id: sessionId,
+            }),
+          });
+
+          if (!response.ok || !response.body) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText || 'Failed to connect to stream'}`);
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            // Parse complete SSE blocks separated by double newlines
+            const blocks = buffer.split('\n\n');
+            buffer = blocks.pop() || '';
+
+            for (const block of blocks) {
+              if (!block.trim()) continue;
+              const lines = block.split('\n');
+              let dataStr = '';
+              for (const line of lines) {
+                if (line.startsWith('data:')) {
+                  dataStr += line.slice(5).trim();
+                }
+              }
+              if (!dataStr) continue;
+
+              let eventObj;
+              try {
+                eventObj = JSON.parse(dataStr);
+              } catch {
+                continue;
+              }
+
+              setMessages((prev) =>
+                prev.map((msg) => {
+                  if (msg.id !== assistantMsgId) return msg;
+
+                  if (eventObj.step_type === 'final' && eventObj.response) {
+                    if (eventObj.response.needs_departure_airport) {
+                      setPendingQuery(trimmed);
+                    } else {
+                      setPendingQuery(null);
+                    }
+                    return {
+                      ...msg,
+                      steps: [...msg.steps, eventObj],
+                      isStreaming: false,
+                      payload: eventObj.response,
+                    };
+                  }
+
+                  if (eventObj.step_type === 'error') {
+                    return {
+                      ...msg,
+                      steps: [...msg.steps, eventObj],
+                      isStreaming: false,
+                      error: eventObj.detail,
+                    };
+                  }
+
+                  return {
+                    ...msg,
+                    steps: [...msg.steps, eventObj],
+                  };
+                })
+              );
+            }
+          }
+        } catch (err) {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId
+                ? {
+                    ...msg,
+                    isStreaming: false,
+                    error:
+                      err.message ||
+                      `Could not reach FastAPI server at ${API_BASE_URL}. Make sure uvicorn server:app is running.`,
+                  }
+                : msg
+            )
+          );
+        } finally {
+          setIsStreaming(false);
+          setMessages((prev) =>
+            prev.map((msg) => (msg.id === assistantMsgId ? { ...msg, isStreaming: false } : msg))
+          );
+        }
+      };
+
+      const handleFormSubmit = (e) => {
+        e.preventDefault();
+        sendMessage(inputValue);
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col bg-white">
+          {/* Sticky Top Navigation Bar */}
+          <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-weroad-border">
+            <div className="max-w-4xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
+              {/* Brand Wordmark */}
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-xl sm:text-2xl font-extrabold tracking-tight text-weroad-red leading-none">
+                  WeRoad<span className="text-weroad-ink">.it</span>
+                </span>
+                <span className="hidden sm:inline-block text-xs font-semibold text-weroad-muted bg-weroad-surface border border-weroad-border px-2.5 py-1 rounded-full">
+                  AI Trip &amp; Flight Finder
+                </span>
+              </div>
+
+              {/* Right Controls: New Chat */}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleNewChat}
+                  disabled={isStreaming}
+                  title="Start a new conversation"
+                  className="inline-flex items-center gap-1.5 rounded-full border border-weroad-border bg-white hover:border-weroad-red hover:text-weroad-red disabled:opacity-50 px-3.5 py-2 text-xs font-semibold text-weroad-ink transition-colors"
+                >
+                  <Icon name="rotate" className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">New</span>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Scrollable Chat Container */}
+          <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 pt-6 pb-32">
+            {messages.length === 0 ? (
+              /* Empty-State Welcome Hero & Starter Cards */
+              <div className="py-8 sm:py-12">
+                <div className="text-center max-w-xl mx-auto mb-9">
+                  <span className="inline-block bg-rose-50 text-weroad-red text-xs font-bold uppercase tracking-wider px-3.5 py-1.5 rounded-full mb-4">
+                    Group Adventures + Live Flights
+                  </span>
+                  <h1 className="text-3xl sm:text-4xl font-extrabold text-weroad-ink tracking-tight leading-tight mb-3">
+                    Where do you want to travel next?
+                  </h1>
+                  <p className="text-sm sm:text-base text-weroad-muted leading-relaxed">
+                    Tell me your dream destination, travel month, duration, and departure airport—watch the agent
+                    reason step-by-step as it matches <strong className="text-weroad-ink">WeRoad</strong> departures
+                    and <strong className="text-weroad-ink">Skyscanner</strong> flights.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  {STARTER_PROMPTS.map((item, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => sendMessage(item.prompt)}
+                      className="group text-left rounded-2xl border border-weroad-border bg-white hover:border-weroad-red hover:bg-rose-50/40 p-4 shadow-sm hover:shadow-soft transition-all"
+                    >
+                      <div className="text-xs font-bold text-weroad-red mb-1">{item.tag}</div>
+                      <div className="text-sm font-extrabold text-weroad-ink group-hover:text-weroad-red transition-colors mb-1">
+                        {item.title}
+                      </div>
+                      <div className="text-xs text-weroad-muted line-clamp-2 leading-relaxed">
+                        {item.prompt}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              /* Conversation Stream */
+              <div className="space-y-6">
+                {messages.map((msg) =>
+                  msg.role === 'user' ? (
+                    <div key={msg.id} className="flex justify-end">
+                      <div className="max-w-[82%] sm:max-w-[75%] rounded-2xl rounded-tr-sm bg-weroad-ink text-white px-4 py-3 text-sm sm:text-[15px] leading-relaxed shadow-soft">
+                        {msg.content}
+                      </div>
+                    </div>
+                  ) : (
+                    <div key={msg.id} className="flex items-start gap-3">
+                      <div className="w-8 h-8 rounded-full bg-weroad-red text-white flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
+                        <Icon name="compass" className="w-4 h-4" />
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        {/* Real-Time Reasoning & Tool Steps Stream */}
+                        <AgentReasoningTimeline steps={msg.steps} isStreaming={msg.isStreaming} />
+
+                        {/* Assistant Bubble Content */}
+                        {(msg.payload || msg.error || (!msg.isStreaming && msg.steps.length === 0)) && (
+                          <div className="rounded-2xl rounded-tl-sm bg-weroad-surface border border-weroad-border p-4 sm:p-5 shadow-sm">
+                            {msg.error ? (
+                              <div className="text-sm text-rose-700 flex items-start gap-2">
+                                <Icon name="alert" className="w-4 h-4 shrink-0 mt-0.5 text-rose-600" />
+                                <span>{msg.error}</span>
+                              </div>
+                            ) : (
+                              <TravelProposalView payload={msg.payload} />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                )}
+                <div ref={bottomRef} />
+              </div>
+            )}
+          </main>
+
+          {/* Bottom Floating Pill Chat Composer */}
+          <footer className="fixed bottom-0 inset-x-0 z-30 bg-gradient-to-t from-white via-white to-white/0 pt-4 pb-5 px-4">
+            <form onSubmit={handleFormSubmit} className="max-w-4xl mx-auto">
+              <div className="flex items-center gap-2 rounded-full border-2 border-weroad-border focus-within:border-weroad-red bg-white shadow-pill px-4 py-2 transition-all">
+                <input
+                  type="text"
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  disabled={isStreaming}
+                  placeholder={
+                    pendingQuery
+                      ? 'Enter your departure airport (e.g., Milan Malpensa, FCO, Venice)...'
+                      : 'Ask about destinations, dates, budget, or flights...'
+                  }
+                  className="flex-1 bg-transparent text-sm sm:text-[15px] text-weroad-ink placeholder-weroad-muted focus:outline-none py-1.5"
+                />
+                <button
+                  type="submit"
+                  disabled={isStreaming || !inputValue.trim()}
+                  className="inline-flex items-center justify-center w-10 h-10 rounded-full bg-weroad-red hover:bg-weroad-darkRed disabled:bg-gray-200 disabled:text-gray-400 text-white shadow-red-glow disabled:shadow-none transition-all shrink-0"
+                  aria-label="Send message"
+                >
+                  <Icon name="send" className="w-4 h-4" />
+                </button>
+              </div>
+            </form>
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

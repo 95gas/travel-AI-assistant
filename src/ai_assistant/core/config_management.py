@@ -53,10 +53,6 @@ class ConfigManager:
         # Raw general YAML contents
         self._general_raw: Dict[str, Any] = {}
 
-        # High-level directory attributes
-        self.dataset_path: Path = Path("./data")
-        self.debug_dir: Path = Path("./debug")
-
         # Strongly-typed WeRoad Assistant configuration & shortcuts
         self.weroad_config: WeRoadAssistantConfig
         self.pipeline_config: WeRoadPipelineConfig
@@ -84,19 +80,11 @@ class ConfigManager:
             return root_fallback
         return candidate
 
-    def _ensure_directories_exist(self) -> None:
-        """Creates runtime directories if they do not exist."""
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
-
     def _load_and_parse(self) -> None:
         """Loads YAML files from disk and validates them into Pydantic schemas."""
         if self.config_path.exists():
             with open(self.config_path, "r", encoding="utf-8") as f:
                 self._general_raw = yaml.safe_load(f) or {}
-
-        self.dataset_path = Path(self._general_raw.get("dataset_path", "./data"))
-        self.debug_dir = Path(self._general_raw.get("debug", "./debug"))
-        self._ensure_directories_exist()
 
         self.weroad_config = WeRoadAssistantConfig.load_from_yaml(self.config_path)
         self.pipeline_config = self.weroad_config.pipeline

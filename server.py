@@ -1,14 +1,16 @@
 """
 FastAPI Backend Server (`server.py`)
 ====================================
-Exposes the guarded two-stage `WeRoadTravelAssistant` over HTTP REST endpoints
-for consumption by the Streamlit web interface or any external client.
+Exposes the guarded two-stage `WeRoadTravelAssistant` over HTTP REST and Server-Sent
+Events (SSE) endpoints, and serves the modern reactive web interface (`index.html`).
 
 Endpoints:
-- `GET  /`            : Service metadata and documentation link
-- `GET  /health`      : Health check and active guardrail/model status
-- `GET  /metrics`     : OpenTelemetry / Prometheus metrics exposition
-- `POST /api/v1/chat` : Executes a guarded WeRoad tour + Skyscanner flight query
+- `GET  /`                   : Serves the web UI (`index.html`) for browsers, or service metadata JSON
+- `GET  /ui`                 : Serves the web UI (`index.html`)
+- `GET  /health`             : Health check and active guardrail/model status
+- `GET  /metrics`            : OpenTelemetry / Prometheus metrics exposition
+- `POST /api/v1/chat`        : Executes a guarded WeRoad tour + Skyscanner flight query (JSON)
+- `POST /api/v1/chat/stream` : Streams real-time agent reasoning, tool steps, and final response (SSE)
 
 Run with:
     uvicorn server:app --host 0.0.0.0 --port 8000 --reload
@@ -18,15 +20,17 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, AsyncIterator, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -43,14 +47,18 @@ from src.ai_assistant.observability.observability import (
     setup_observability,
 )
 from src.ai_assistant.schemas.schemas import (
+    AgentStreamEvent,
     ChatQueryRequest,
     HealthCheckResponse,
     ServerConfig,
+    StreamStepType,
     TravelProposalResponse,
 )
 
 logger = logging.getLogger("WeRoadFastAPIServer")
 _tracer = get_tracer("weroad.fastapi")
+
+FRONTEND_HTML_PATH = PROJECT_ROOT / "index.html"
 
 # Global runtime references managed via FastAPI lifespan
 _config_manager: Optional[ConfigManager] = None
@@ -82,9 +90,10 @@ app = FastAPI(
     title="WeRoad Agentic Travel Assistant API",
     description=(
         "Two-stage PydanticAI travel assistant with Llama Guard I/O moderation, "
-        "WeRoad.it catalog & departure scraping, and Skyscanner round-trip flight lookups."
+        "WeRoad.it catalog & departure scraping, Skyscanner round-trip flight lookups, "
+        "and real-time SSE agent step streaming."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -116,15 +125,34 @@ async def tracing_middleware(request: Request, call_next) -> Response:
 
 
 @app.get("/", tags=["Meta"])
-async def root() -> dict[str, str]:
-    """Root endpoint providing API navigation links."""
-    return {
-        "service": "WeRoad Agentic Travel Assistant API",
-        "docs": "/docs",
-        "health": "/health",
-        "metrics": "/metrics",
-        "chat_endpoint": "/api/v1/chat",
-    }
+async def root(request: Request) -> Response:
+    """Serves the modern web interface when opened in a browser, or API metadata JSON otherwise."""
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and FRONTEND_HTML_PATH.exists():
+        return FileResponse(FRONTEND_HTML_PATH, media_type="text/html")
+
+    return JSONResponse(
+        {
+            "service": "WeRoad Agentic Travel Assistant API",
+            "ui": "/ui",
+            "docs": "/docs",
+            "health": "/health",
+            "metrics": "/metrics",
+            "chat_endpoint": "/api/v1/chat",
+            "stream_endpoint": "/api/v1/chat/stream",
+        }
+    )
+
+
+@app.get("/ui", tags=["UI"])
+async def serve_ui() -> FileResponse:
+    """Serves the reactive WeRoad AI Travel & Flight Finder frontend (`index.html`)."""
+    if not FRONTEND_HTML_PATH.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Frontend file `index.html` not found in project root.",
+        )
+    return FileResponse(FRONTEND_HTML_PATH, media_type="text/html")
 
 
 @app.get("/health", response_model=HealthCheckResponse, tags=["Health"])
@@ -179,6 +207,55 @@ async def chat_query(request: ChatQueryRequest) -> TravelProposalResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process travel query: {exc}",
         ) from exc
+
+
+@app.post("/api/v1/chat/stream", tags=["Travel Assistant"])
+async def chat_query_stream(request: ChatQueryRequest) -> StreamingResponse:
+    """
+    Streams real-time Server-Sent Events (`text/event-stream`) representing every step
+    and intermediate reasoning stage of the WeRoad Travel Assistant, concluding with
+    the final `TravelProposalResponse`.
+    """
+    if _assistant is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WeRoadTravelAssistant is still initializing. Please retry shortly.",
+        )
+
+    effective_query = request.query.strip()
+    if request.departure_airport and request.departure_airport.strip():
+        effective_query = f"{effective_query} (departing from {request.departure_airport.strip()})"
+
+    logger.info(
+        f"Received /api/v1/chat/stream request [session={request.session_id or 'anonymous'}]: "
+        f"'{effective_query[:80]}'"
+    )
+
+    async def _sse_generator() -> AsyncIterator[str]:
+        assert _assistant is not None
+        try:
+            async for event in _assistant.stream_query(effective_query):
+                payload = event.model_dump_json()
+                yield f"event: {event.step_type.value}\ndata: {payload}\n\n"
+        except Exception as exc:
+            logger.exception(f"Unhandled error during /api/v1/chat/stream execution: {exc}")
+            err_event = AgentStreamEvent(
+                step_type=StreamStepType.ERROR,
+                stage="error",
+                title="Execution Error",
+                detail=f"Failed to process travel query: {exc}",
+            )
+            yield f"event: error\ndata: {err_event.model_dump_json()}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":

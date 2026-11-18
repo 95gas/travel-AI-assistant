@@ -1,56 +1,55 @@
 # WeRoad Agentic Travel Assistant Configuration File
 pipeline:
   # Default fallback LLM (used if any specialized role LLM below is omitted)
-  # Supported prefixes:
-  #   - "transformers:google/gemma-3-1b-it"  -> Local Hugging Face `transformers` (in-process)
-  #   - "ollama:gemma4:12b"                  -> Local Ollama server
-  #   - "huggingface:google/gemma-3-27b-it"  -> Remote Hugging Face Inference Providers
+  # Uses OpenRouter's Free Models Router (`openrouter/free`), which automatically routes
+  # requests to free models supporting required capabilities (tool calling, structured outputs,
+  # and reasoning tokens). Requires `OPENROUTER_API_KEY` in `.env`.
+  # Supported `reasoning_effort` values: "none", "minimal", "low", "medium", "high", "xhigh", "max".
   llm_default:
-    model_name: "transformers:google/gemma-3-1b-it"
-    device: "cpu"
-    torch_dtype: "bfloat16"
+    model_name: "openrouter:openrouter/free"
     provider: null
     temperature: 0.2
-    max_tokens: 2048
+    max_tokens: 4096
+    reasoning_enabled: true
+    reasoning_effort: "medium"
 
   # Stage 1: Natural-Language Query -> Structured TravelSearchIntent
   llm_intent:
-    model_name: "transformers:google/gemma-3-1b-it"
-    device: "auto"
-    torch_dtype: "bfloat16"
+    model_name: "openrouter:openrouter/free"
     provider: null
     temperature: 0.0
-    max_tokens: 600
+    max_tokens: 1500
+    reasoning_enabled: true
+    reasoning_effort: "low"
 
   # Stage 2: MCP Tool-Equipped Search & Departure Synthesis -> TravelProposalResponse
-  # Local `transformers` options by GPU VRAM / unified memory:
-  #   - "transformers:google/gemma-3-1b-it"  (~8 GB in bfloat16)
-  #   - "transformers:google/gemma-3-1b-it" (~24 GB in bfloat16)
   llm_proposal:
-    model_name: "transformers:google/gemma-3-1b-it"
-    device: "cpu"
-    torch_dtype: "bfloat16"
+    model_name: "openrouter:openrouter/free"
     provider: null
     temperature: 0.2
-    max_tokens: 2500
+    max_tokens: 4096
+    reasoning_enabled: true
+    reasoning_effort: "medium"
 
-  # Agent execution step limits
-  intent_request_limit: 2
-  proposal_request_limit: 8
+  # Agent execution step limits & airport gate
+  # Free/reasoning models often issue tool calls sequentially and may take 1-2 structured
+  # output retries, so keep generous request limits for both stages.
+  intent_request_limit: 4
+  proposal_request_limit: 25
+  require_departure_airport: true
 
 llama_guard:
   enabled: true
-  # Lightweight local safeguard options via `transformers`:
-  #   - "transformers:google/gemma-3-1b-it"     (~2 GB in bfloat16, fast IT/EN classifier)
-  #   - "transformers:google/shieldgemma-2b"    (~5 GB in bfloat16, dedicated safety classifier)
-  model_name: "transformers:google/gemma-3-1b-it"
-  device: "cpu"
-  torch_dtype: "bfloat16"
+  # Uses OpenRouter Free Models Router. Note: `openrouter/free` may route to reasoning models
+  # that emit internal thinking tokens even when `reasoning_enabled: false`, so `max_tokens`
+  # is set to 1024 to prevent premature truncation before 'safe'/'unsafe' is generated.
+  model_name: "openrouter:openrouter/free"
   provider: null
+  reasoning_enabled: true
   check_input: true
   check_output: true
   temperature: 0.0
-  max_tokens: 100
+  max_tokens: 1024
   fail_open: false
   blocked_input_message: "I'm sorry, I cannot process this request because it violates our content safety guidelines. Please ask a travel-related question."
   blocked_output_message: "I'm sorry, the generated travel response could not be displayed due to content safety policies. Please try rephrasing your travel request."
@@ -102,8 +101,11 @@ server:
   port: 8000
   api_base_url: "http://localhost:8000"
   cors_origins:
-    - "http://localhost:8501"
-    - "http://127.0.0.1:8501"
+    - "http://localhost:8000"
+    - "http://127.0.0.1:8000"
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
+    - "null"
 
 observability:
   enabled: true
@@ -133,9 +135,9 @@ prompts:
     You are an expert WeRoad travel advisor. Today's date is {today_str}.
     Given the user's travel request and parsed `TravelSearchIntent`:
     1. Call `search_weroad_tours` using `destination_slug_keywords` and duration/budget filters.
-    2. For the top 3-5 matching itineraries, call `get_tour_departures` using the tour `slug` and date bounds (`earliest_date`, `latest_date` in YYYY-MM-DD format if specified).
+    2. For the top 2-3 matching itineraries, call `get_tour_departures` (batching tool calls in parallel when possible) using the tour `slug` and date bounds (`earliest_date`, `latest_date` in YYYY-MM-DD format if specified).
     3. Prioritize departures with status 'Confermato' or 'Quasi pieno', followed by 'Disponibile'. Exclude 'Sold out' departures from `matching_dates` unless no other slots exist.
-    4. For the top available departure slots, call `search_flights` using `origin_airport` (`departure_airport_iata` or `departure_airport`), `destination` (`destination_airport_iata` or `destination`), `departure_date` (`start_date`), and `return_date` (`end_date`), and attach the Skyscanner results to `matching_flights` on each `RecommendedTourProposal`.
+    4. For the top 2-3 available departure slots across the selected tours, call `search_flights` (batching tool calls in parallel when possible) using `origin_airport` (`departure_airport_iata` or `departure_airport`), `destination` (`destination_airport_iata` or `destination`), `departure_date` (`start_date`), and `return_date` (`end_date`), and attach the Skyscanner results to `matching_flights` on each `RecommendedTourProposal`.
     5. If the user specified their age, highlight compatible age cohorts (e.g., '25-35' vs '35-49').
     6. Write `assistant_message` and `why_it_fits` in the same language as the user's query. For each recommended departure date, explicitly report the round-trip flight cost in EUR (noting when a price is an estimate), the flight duration and stops, and include the clickable Skyscanner link(s) (`booking_url`).
 

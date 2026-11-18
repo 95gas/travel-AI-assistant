@@ -3,18 +3,22 @@ Domain Schemas & Configuration Models (`common/schemas.py`)
 ===========================================================
 Defines all Pydantic v2 data contracts shared across `agent.py`, the Llama Guard
 moderator, `config_management.py`, the WeRoad parser, the MCP tool server,
-the two-stage orchestrator, the FastAPI backend, and the Streamlit UI.
+the two-stage orchestrator, the FastAPI backend, and the web frontend.
 """
 
 from __future__ import annotations
 
+import time
+import uuid
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, HttpUrl
+
+ReasoningEffort = Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"]
 
 
 # ---------------------------------------------------------------------------
@@ -26,25 +30,60 @@ class LLMConfig(BaseModel):
     """LLM configuration schema consumed by `GenericAgent` in `agent.py`."""
 
     model_name: str = Field(
-        default="openrouter:openai/gpt-4o-mini",
-        description="PydanticAI model identifier (e.g. 'openrouter:openai/gpt-4o-mini', 'openai:gpt-4o-mini').",
+        default="openrouter:openrouter/free",
+        description=(
+            "PydanticAI model identifier (e.g. 'openrouter:openrouter/free', "
+            "'openrouter:nvidia/nemotron-3-nano-30b-a3b:free', 'ollama:qwen2.5:3b')."
+        ),
     )
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, gt=0)
     provider: Optional[str] = None
+    base_url: Optional[str] = None
     device: Optional[str] = None
     torch_dtype: Optional[str] = None
+    load_in_4bit: bool = False
+    reasoning_enabled: Optional[bool] = Field(
+        default=None,
+        description="Enable or disable reasoning/thinking tokens (e.g. on OpenRouter models).",
+    )
+    reasoning_effort: Optional[ReasoningEffort] = Field(
+        default=None,
+        description="OpenRouter/OpenAI-style reasoning effort level ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max').",
+    )
+    reasoning_max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Optional explicit reasoning token budget (cannot be combined with reasoning_effort).",
+    )
+    reasoning_exclude: Optional[bool] = Field(
+        default=None,
+        description="If True, the model reasons internally without returning reasoning text in the response.",
+    )
 
 
 class LlamaGuardConfig(BaseModel):
     """Configuration for input/output safety moderation via Llama Guard."""
 
     enabled: bool = Field(default=True)
-    model_name: str = Field(default="openrouter:meta-llama/llama-guard-4-12b")
+    model_name: str = Field(default="openrouter:openrouter/free")
+    provider: Optional[str] = None
+    device: Optional[str] = None
+    torch_dtype: Optional[str] = None
+    load_in_4bit: bool = False
+    reasoning_enabled: Optional[bool] = Field(
+        default=False,
+        description="Disabled by default so safety classification returns fast 'safe'/'unsafe' verdicts.",
+    )
+    reasoning_effort: Optional[ReasoningEffort] = Field(default=None)
     check_input: bool = Field(default=True)
     check_output: bool = Field(default=True)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=100, gt=0)
+    max_tokens: int = Field(
+        default=1024,
+        gt=0,
+        description="Maximum tokens for moderation response (set >= 1024 when routing through models with mandatory reasoning tokens).",
+    )
     fail_open: bool = Field(
         default=False,
         description="If True, allow traffic when moderation fails with a runtime error; if False, block on error.",
@@ -131,15 +170,20 @@ class FlightSearchConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """Configuration for the FastAPI backend server and Streamlit client connection."""
+    """Configuration for the FastAPI backend server and web client connection."""
 
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000, ge=1, le=65535)
     api_base_url: str = Field(default="http://localhost:8000")
     cors_origins: List[str] = Field(
         default_factory=lambda: [
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
             "http://localhost:8501",
             "http://127.0.0.1:8501",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "null",
         ]
     )
 
@@ -204,8 +248,8 @@ class WeRoadPipelineConfig(BaseModel):
     llm_default: LLMConfig = Field(default_factory=LLMConfig)
     llm_intent: Optional[LLMConfig] = None
     llm_proposal: Optional[LLMConfig] = None
-    intent_request_limit: int = Field(default=2, ge=1)
-    proposal_request_limit: int = Field(default=10, ge=1)
+    intent_request_limit: int = Field(default=4, ge=1)
+    proposal_request_limit: int = Field(default=25, ge=1)
     require_departure_airport: bool = Field(default=True)
 
     @property
@@ -244,11 +288,12 @@ class WeRoadPromptsConfig(BaseModel):
             "You are an expert WeRoad travel advisor. Today's date is {today_str}.\n"
             "Given the user's travel request and parsed `TravelSearchIntent`:\n"
             "1. Call `search_weroad_tours` using `destination_slug_keywords` and duration/budget filters.\n"
-            "2. For the top 3-5 matching itineraries, call `get_tour_departures` using the tour `slug` "
-            "and date bounds (`earliest_date`, `latest_date` in YYYY-MM-DD format if specified).\n"
+            "2. For the top 2-3 matching itineraries, call `get_tour_departures` (batching tool calls in parallel when possible) "
+            "using the tour `slug` and date bounds (`earliest_date`, `latest_date` in YYYY-MM-DD format if specified).\n"
             "3. Prioritize departures with status 'Confermato' or 'Quasi pieno', followed by 'Disponibile'. "
             "Exclude 'Sold out' departures from `matching_dates` unless no other slots exist.\n"
-            "4. Call `search_flights` for the top available departure dates and attach results to `matching_flights`.\n"
+            "4. Call `search_flights` (batching tool calls in parallel when possible) for the top 2-3 available departure dates "
+            "and attach results to `matching_flights`.\n"
             "5. Report flight costs in EUR, flight durations, stops, and clickable Skyscanner links (`booking_url`)."
         )
     )
@@ -473,12 +518,61 @@ class TravelProposalResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Real-Time Agent Streaming Event Schemas
+# ---------------------------------------------------------------------------
+
+
+class StreamStepType(str, Enum):
+    """Semantic classification of a real-time agent execution or reasoning event."""
+
+    STATUS = "status"
+    REASONING = "reasoning"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    FINAL = "final"
+    ERROR = "error"
+
+
+class AgentStreamEvent(BaseModel):
+    """Single Server-Sent Event (SSE) emitted during live agent execution."""
+
+    event_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    step_type: StreamStepType
+    stage: str = Field(
+        ...,
+        description="Pipeline stage identifier (e.g., 'guardrail_input', 'intent_extraction', 'proposal_synthesis', 'tool_execution', 'guardrail_output', 'complete').",
+    )
+    title: str = Field(..., description="Short scannable headline for the UI timeline.")
+    detail: str = Field(
+        ...,
+        description="Human-readable intermediate reasoning or action detail (e.g., 'Looking for round-trip flights from MXP to TYO...').",
+    )
+    tool_name: Optional[str] = Field(
+        None,
+        description="Invoked MCP/function tool name when `step_type` is 'tool_call' or 'tool_result'.",
+    )
+    tool_args: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Structured arguments passed to the tool.",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional extra metadata (e.g., elapsed_ms, item_count, destination).",
+    )
+    timestamp_ms: int = Field(default_factory=lambda: int(time.time() * 1000))
+    response: Optional[TravelProposalResponse] = Field(
+        None,
+        description="Final structured `TravelProposalResponse` attached when `step_type == 'final'`.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # FastAPI Request & Response Schemas
 # ---------------------------------------------------------------------------
 
 
 class ChatQueryRequest(BaseModel):
-    """Request payload accepted by `POST /api/v1/chat`."""
+    """Request payload accepted by `POST /api/v1/chat` and `POST /api/v1/chat/stream`."""
 
     query: str = Field(
         ...,
@@ -502,4 +596,4 @@ class HealthCheckResponse(BaseModel):
     service: str = Field(default="weroad-travel-assistant-api")
     guardrail_enabled: bool = Field(default=True)
     flight_provider: str = Field(default="skyscanner")
-    default_model: str = Field(default="openrouter:openai/gpt-4o-mini")
+    default_model: str = Field(default="openrouter:openrouter/free")

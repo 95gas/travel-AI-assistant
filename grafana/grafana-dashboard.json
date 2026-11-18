@@ -16,7 +16,7 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
       "targets": [
         {
-          "expr": "sum(weroad_llm_tokens_total{token_type=\"input\"})",
+          "expr": "sum({__name__=~\"weroad_llm_tokens.*_total\", token_type=\"input\"})",
           "legendFormat": "Input Tokens",
           "refId": "A"
         }
@@ -34,7 +34,7 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
       "targets": [
         {
-          "expr": "sum(weroad_llm_tokens_total{token_type=\"output\"})",
+          "expr": "sum({__name__=~\"weroad_llm_tokens.*_total\", token_type=\"output\"})",
           "legendFormat": "Output Tokens",
           "refId": "A"
         }
@@ -52,7 +52,7 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
       "targets": [
         {
-          "expr": "sum(weroad_llm_tokens_total{token_type=\"total\"})",
+          "expr": "sum({__name__=~\"weroad_llm_tokens.*_total\", token_type=\"total\"})",
           "legendFormat": "Total Tokens",
           "refId": "A"
         }
@@ -70,7 +70,7 @@
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
       "targets": [
         {
-          "expr": "sum(weroad_guardrail_checks_total{decision=\"blocked\"}) or vector(0)",
+          "expr": "sum({__name__=~\"weroad_guardrail_checks.*_total\", decision=\"blocked\"}) or vector(0)",
           "legendFormat": "Blocked",
           "refId": "A"
         }
@@ -87,7 +87,7 @@
       "id": 5,
       "targets": [
         {
-          "expr": "sum by (stage, token_type) (increase(weroad_llm_tokens_total{token_type!=\"total\"}[5m]))",
+          "expr": "sum by (stage, token_type) (increase({__name__=~\"weroad_llm_tokens.*_total\", token_type!=\"total\"}[5m]))",
           "legendFormat": "{{stage}} ({{token_type}})",
           "refId": "A"
         }
@@ -104,7 +104,7 @@
       "id": 6,
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(weroad_llm_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate({__name__=~\"weroad_llm_request_duration.*_bucket\"}[5m])))",
           "legendFormat": "p95 {{stage}}",
           "refId": "A"
         }
@@ -141,4 +141,3 @@
   "title": "WeRoad Agentic Assistant Observability",
   "uid": "weroad-agentic-obs"
 }
-```

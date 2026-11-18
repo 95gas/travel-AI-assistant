@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional, Any, Sequence, Union
+from typing import Any, AsyncIterator, Optional, Sequence, Union
 
 from pydantic_ai import Agent, ModelSettings, UsageLimits
 from pydantic_ai.mcp import load_mcp_toolsets
@@ -29,15 +29,28 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 try:
+    from pydantic_ai.messages import ThinkingPart
+except ImportError:  # pragma: no cover
+    ThinkingPart = None  # type: ignore[assignment,misc]
+
+try:
     from pydantic_ai.profiles import ModelProfile
 except ImportError:  # pragma: no cover
     ModelProfile = None  # type: ignore[assignment,misc]
 
-from src.ai_assistant.schemas.schemas import LLMConfig
-from src.ai_assistant.observability.observability import extract_usage_from_result, get_tracer, record_llm_usage
+from src.ai_assistant.schemas.schemas import (
+    AgentStreamEvent,
+    LLMConfig,
+    StreamStepType,
+)
+from src.ai_assistant.observability.observability import (
+    extract_usage_from_result,
+    get_tracer,
+    record_llm_usage,
+)
 
 _tracer = get_tracer("weroad.agent")
-_TRANSFORMERS_CACHE: dict[tuple[str, str, str], tuple[Any, Any]] = {}
+_TRANSFORMERS_CACHE: dict[tuple[str, str, str, bool], tuple[Any, Any]] = {}
 _TRANSFORMERS_CACHE_LOCK = threading.Lock()
 
 logging.basicConfig(
@@ -53,10 +66,13 @@ class GenericAgent:
     A generic, reusable wrapper around Pydantic AI's Agent class.
 
     Supports:
+    - OpenRouter Free Models Router & `:free` variants (`openrouter:openrouter/free`, etc.)
+      with unified reasoning tokens (`reasoning_enabled`, `reasoning_effort`, `reasoning_max_tokens`)
+    - Local Ollama servers (`ollama:qwen2.5:3b`, `ollama:qwen2.5:1.5b`, etc.)
     - Local Hugging Face `transformers` checkpoints (`transformers:google/gemma-3-1b-it`, etc.)
-    - Local Ollama servers (`ollama:gemma4:12b`, `ollama:gemma4:e4b`, etc.)
     - Remote Hugging Face Inference Providers (`huggingface:google/gemma-3-27b-it`, etc.)
     - Structured Pydantic output types, MCP toolsets, and OpenTelemetry instrumentation
+    - Real-time node-by-node streaming (`run_stream`) of intermediate reasoning and tool calls
     """
 
     def __init__(
@@ -74,8 +90,13 @@ class GenericAgent:
         self.base_url = getattr(llm_settings, "base_url", None)
         self.device = getattr(llm_settings, "device", None) or "auto"
         self.torch_dtype = getattr(llm_settings, "torch_dtype", None) or "auto"
+        self.load_in_4bit = bool(getattr(llm_settings, "load_in_4bit", False))
         self.temperature = llm_settings.temperature
         self.max_tokens = llm_settings.max_tokens
+        self.reasoning_enabled: Optional[bool] = getattr(llm_settings, "reasoning_enabled", None)
+        self.reasoning_effort: Optional[str] = getattr(llm_settings, "reasoning_effort", None)
+        self.reasoning_max_tokens: Optional[int] = getattr(llm_settings, "reasoning_max_tokens", None)
+        self.reasoning_exclude: Optional[bool] = getattr(llm_settings, "reasoning_exclude", None)
         self.system_prompt = system_prompt
         self.output_type = output_type
         self.mcp_config_path = Path(mcp_config_path) if mcp_config_path else None
@@ -87,6 +108,7 @@ class GenericAgent:
             "total_tokens": 0,
             "requests": 0,
         }
+        self.last_output: Any = None
 
         self.toolsets = None
         if self.mcp_config_path:
@@ -102,15 +124,15 @@ class GenericAgent:
             max_tokens=self.max_tokens,
             device=self.device,
             torch_dtype=self.torch_dtype,
+            load_in_4bit=self.load_in_4bit,
         )
+
+        model_settings = self._build_model_settings()
 
         agent_kwargs: dict[str, Any] = {
             "model": resolved_model,
             "system_prompt": self.system_prompt,
-            "model_settings": ModelSettings(
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            ),
+            "model_settings": model_settings,
         }
         if self.output_type is not None:
             agent_kwargs["output_type"] = self.output_type
@@ -124,11 +146,152 @@ class GenericAgent:
         except TypeError:
             self.agent = Agent(**agent_kwargs)
 
+    def _build_openrouter_reasoning_config(self) -> Optional[dict[str, Any]]:
+        """
+        Builds OpenRouter's unified `reasoning` config object.
+        OpenRouter accepts either `effort` or `max_tokens` (not both simultaneously),
+        or `enabled: True/False`, plus optional `exclude: True/False`.
+        For `openrouter:` models, reasoning defaults to enabled unless explicitly disabled.
+        """
+        reasoning_cfg: dict[str, Any] = {}
+
+        if self.reasoning_enabled is False:
+            reasoning_cfg["enabled"] = False
+        elif self.reasoning_effort is not None:
+            reasoning_cfg["effort"] = self.reasoning_effort
+        elif self.reasoning_max_tokens is not None:
+            reasoning_cfg["max_tokens"] = self.reasoning_max_tokens
+        elif self.reasoning_enabled is True or self.model_name.startswith("openrouter:"):
+            reasoning_cfg["enabled"] = True
+
+        if self.reasoning_exclude is not None:
+            reasoning_cfg["exclude"] = self.reasoning_exclude
+
+        return reasoning_cfg or None
+
+    def _build_model_settings(self) -> ModelSettings:
+        """Constructs provider-appropriate `ModelSettings` (including OpenRouter reasoning & streaming usage)."""
+        if self.model_name.startswith("openrouter:"):
+            reasoning_cfg = self._build_openrouter_reasoning_config()
+            extra_body: dict[str, Any] = {
+                "usage": {"include": True},
+                "stream_options": {"include_usage": True},
+            }
+            if reasoning_cfg is not None:
+                extra_body["reasoning"] = reasoning_cfg
+
+            try:
+                from pydantic_ai.models.openrouter import OpenRouterModelSettings
+
+                or_kwargs: dict[str, Any] = {
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                    "openrouter_usage": {"include": True},
+                    "extra_body": {"stream_options": {"include_usage": True}},
+                }
+                if reasoning_cfg is not None:
+                    or_kwargs["openrouter_reasoning"] = reasoning_cfg
+                return OpenRouterModelSettings(**or_kwargs)
+            except (ImportError, TypeError):
+                return ModelSettings(
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    extra_body=extra_body,
+                )
+
+        # For local Ollama models on 4 GB GPUs, cap `num_ctx` to 3072 (shared across all stages)
+        # so Ollama keeps a single loaded runner and avoids KV-cache VRAM OOM crashes (0xc0000409).
+        if self.model_name.startswith("ollama:"):
+            ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "3072"))
+            return ModelSettings(
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                extra_body={"options": {"num_ctx": ollama_num_ctx}},
+            )
+
+        return ModelSettings(
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+
+    @staticmethod
+    def _extract_usage(result: Any) -> dict[str, int]:
+        """
+        Extracts token usage from a PydanticAI `AgentRunResult`, falling back to
+        inspecting `result.usage()` / `result.usage` and `ModelResponse.usage` parts
+        if `extract_usage_from_result` returns zeros.
+        """
+        usage = dict(extract_usage_from_result(result))
+        if usage.get("total_tokens", 0) > 0 or result is None:
+            return usage
+
+        raw_usage = getattr(result, "usage", None)
+        if callable(raw_usage):
+            try:
+                raw_usage = raw_usage()
+            except Exception:
+                raw_usage = None
+
+        if raw_usage is not None:
+            in_tok = int(
+                getattr(raw_usage, "input_tokens", None)
+                or getattr(raw_usage, "request_tokens", None)
+                or getattr(raw_usage, "prompt_tokens", None)
+                or 0
+            )
+            out_tok = int(
+                getattr(raw_usage, "output_tokens", None)
+                or getattr(raw_usage, "response_tokens", None)
+                or getattr(raw_usage, "completion_tokens", None)
+                or 0
+            )
+            tot_tok = int(getattr(raw_usage, "total_tokens", None) or (in_tok + out_tok))
+            reqs = int(getattr(raw_usage, "requests", None) or usage.get("requests", 1) or 1)
+            if tot_tok > 0 or in_tok > 0 or out_tok > 0:
+                return {
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "total_tokens": tot_tok or (in_tok + out_tok),
+                    "requests": reqs,
+                }
+
+        messages_fn = getattr(result, "new_messages", None) or getattr(result, "all_messages", None)
+        if callable(messages_fn):
+            try:
+                in_sum = 0
+                out_sum = 0
+                resp_count = 0
+                for msg in messages_fn():
+                    msg_usage = getattr(msg, "usage", None)
+                    if msg_usage is not None:
+                        resp_count += 1
+                        in_sum += int(
+                            getattr(msg_usage, "input_tokens", None)
+                            or getattr(msg_usage, "request_tokens", None)
+                            or 0
+                        )
+                        out_sum += int(
+                            getattr(msg_usage, "output_tokens", None)
+                            or getattr(msg_usage, "response_tokens", None)
+                            or 0
+                        )
+                if (in_sum + out_sum) > 0:
+                    return {
+                        "input_tokens": in_sum,
+                        "output_tokens": out_sum,
+                        "total_tokens": in_sum + out_sum,
+                        "requests": max(resp_count, 1),
+                    }
+            except Exception:
+                pass
+
+        return usage
+
     def _build_mcp_toolsets(self) -> Any:
         """
         Loads MCP toolsets from `self.mcp_config_path`, normalizing `python`/`python3`
         commands to `sys.executable` and injecting `PYTHONPATH` so stdio MCP subprocesses
-        on Windows run inside the active virtual environment without failing on startup.
+        run inside the active virtual environment without failing on startup.
         """
         assert self.mcp_config_path is not None
         try:
@@ -182,6 +345,7 @@ class GenericAgent:
         model_name: str,
         device: Optional[str] = None,
         torch_dtype: Optional[str] = None,
+        load_in_4bit: bool = False,
     ) -> None:
         """
         Preloads a local `transformers:` checkpoint into the shared in-memory cache
@@ -193,6 +357,7 @@ class GenericAgent:
                 repo_id=repo_id,
                 device=device or "auto",
                 torch_dtype=torch_dtype or "auto",
+                load_in_4bit=load_in_4bit,
             )
 
     @staticmethod
@@ -200,11 +365,13 @@ class GenericAgent:
         repo_id: str,
         device: Optional[str] = None,
         torch_dtype: Optional[str] = None,
+        load_in_4bit: bool = False,
     ) -> tuple[Any, Any]:
         """Loads and caches a Hugging Face `transformers` tokenizer and causal LM."""
         norm_device = device or "auto"
         norm_dtype = torch_dtype or "auto"
-        cache_key = (repo_id, norm_device, norm_dtype)
+        norm_4bit = bool(load_in_4bit)
+        cache_key = (repo_id, norm_device, norm_dtype, norm_4bit)
 
         with _TRANSFORMERS_CACHE_LOCK:
             if cache_key in _TRANSFORMERS_CACHE:
@@ -223,15 +390,37 @@ class GenericAgent:
             if norm_dtype != "auto":
                 resolved_dtype = getattr(torch, norm_dtype, "auto")
 
+            quantization_config = None
+            if norm_4bit:
+                if torch.cuda.is_available() and importlib.util.find_spec("bitsandbytes") is not None:
+                    from transformers import BitsAndBytesConfig
+
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_quant_type="nf4",
+                    )
+                else:
+                    logger.warning(
+                        "load_in_4bit=True requested, but CUDA + `bitsandbytes` is unavailable; "
+                        "falling back to standard precision."
+                    )
+
             has_accelerate = importlib.util.find_spec("accelerate") is not None
             logger.info(
                 f"Loading local Hugging Face transformers model: {repo_id} "
-                f"(device={norm_device}, dtype={norm_dtype}, accelerate={has_accelerate})..."
+                f"(device={norm_device}, dtype={norm_dtype}, 4bit={quantization_config is not None}, accelerate={has_accelerate})..."
             )
             load_start = time.perf_counter()
             tokenizer = AutoTokenizer.from_pretrained(repo_id)
 
-            if has_accelerate:
+            if quantization_config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    repo_id,
+                    quantization_config=quantization_config,
+                    device_map=norm_device,
+                )
+            elif has_accelerate:
                 model = AutoModelForCausalLM.from_pretrained(
                     repo_id,
                     torch_dtype=resolved_dtype,
@@ -287,14 +476,13 @@ class GenericAgent:
     ) -> Any:
         """
         Converts a verbose JSON Schema into a compact concrete JSON template so smaller
-        local models (e.g., Gemma 1B/4B) populate field values instead of echoing `"properties": {...}`.
+        local models populate field values instead of echoing `"properties": {...}`.
         """
         if root_schema is None:
             root_schema = schema
         if depth > 3 or not isinstance(schema, dict):
             return None
 
-        # Resolve local $ref pointers (e.g. "#/$defs/MySubModel")
         if "$ref" in schema and isinstance(schema["$ref"], str):
             ref_path = schema["$ref"].lstrip("#/").split("/")
             target: Any = root_schema
@@ -307,7 +495,6 @@ class GenericAgent:
             if isinstance(target, dict):
                 return cls._schema_to_example_json(target, root_schema, depth + 1)
 
-        # Unwrap Optional[...] / Union[...] branches to pick the concrete non-null schema
         for union_key in ("anyOf", "oneOf"):
             if union_key in schema and isinstance(schema[union_key], list):
                 non_null = [
@@ -361,6 +548,7 @@ class GenericAgent:
         max_tokens: int,
         device: Optional[str] = None,
         torch_dtype: Optional[str] = None,
+        load_in_4bit: bool = False,
     ) -> FunctionModel:
         """
         Wraps a local Hugging Face `transformers` causal LM in PydanticAI's `FunctionModel`
@@ -369,7 +557,7 @@ class GenericAgent:
 
         async def _run_local_transformers(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             tokenizer, model = await asyncio.to_thread(
-                cls._load_transformers_pipeline, repo_id, device, torch_dtype
+                cls._load_transformers_pipeline, repo_id, device, torch_dtype, load_in_4bit
             )
 
             system_chunks: list[str] = []
@@ -461,8 +649,6 @@ class GenericAgent:
                     f"{json.dumps(example_template, ensure_ascii=False, indent=2)}"
                 )
 
-            # Gemma chat templates require strict user/assistant alternation without a `system` role;
-            # prepend combined system instructions to the first user message.
             if system_chunks:
                 combined_system = "\n\n".join(system_chunks).strip()
                 if chat_messages and chat_messages[0]["role"] == "user":
@@ -470,7 +656,6 @@ class GenericAgent:
                 else:
                     chat_messages.insert(0, {"role": "user", "content": combined_system})
 
-            # Merge consecutive messages of the same role so Gemma's chat template alternation never fails
             merged_messages: list[dict[str, str]] = []
             for entry in chat_messages:
                 if merged_messages and merged_messages[-1]["role"] == entry["role"]:
@@ -521,7 +706,6 @@ class GenericAgent:
 
             parsed_json = cls._extract_json_payload(decoded_text)
             if parsed_json is not None:
-                # 1. Check if the model emitted a function/MCP tool call
                 if "tool_call" in parsed_json and isinstance(parsed_json["tool_call"], dict) and function_tools:
                     tc = parsed_json["tool_call"]
                     tc_name = str(tc.get("name", ""))
@@ -538,7 +722,6 @@ class GenericAgent:
                         model_name=f"transformers:{repo_id}",
                     )
 
-                # 2. Check if PydanticAI expects a structured Pydantic output tool
                 if output_tools and not allow_text_output:
                     target_tool = output_tools[0]
                     return ModelResponse(
@@ -553,7 +736,6 @@ class GenericAgent:
                         model_name=f"transformers:{repo_id}",
                     )
 
-                # 3. If PydanticAI is using PromptedOutput (`allow_text_output=True`), return clean JSON text
                 return ModelResponse(
                     parts=[TextPart(content=json.dumps(parsed_json, ensure_ascii=False))],
                     usage=usage,
@@ -588,7 +770,60 @@ class GenericAgent:
         max_tokens: int = 2048,
         device: Optional[str] = None,
         torch_dtype: Optional[str] = None,
+        load_in_4bit: bool = False,
     ) -> Any:
+        if model_name.startswith("openrouter:"):
+            openrouter_model_id = model_name.split(":", 1)[1]
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                logger.warning(
+                    "OPENROUTER_API_KEY environment variable is not set; OpenRouter requests may fail."
+                )
+
+            app_url = os.getenv("OPENROUTER_SITE_URL") or os.getenv("HTTP_REFERER")
+            app_title = (
+                os.getenv("OPENROUTER_APP_NAME")
+                or os.getenv("X_TITLE")
+                or "WeRoad Travel Assistant"
+            )
+
+            try:
+                from pydantic_ai.models.openrouter import OpenRouterModel
+                from pydantic_ai.providers.openrouter import OpenRouterProvider
+
+                provider_kwargs: dict[str, Any] = {}
+                if api_key:
+                    provider_kwargs["api_key"] = api_key
+                if app_url:
+                    provider_kwargs["app_url"] = app_url
+                if app_title:
+                    provider_kwargs["app_title"] = app_title
+
+                try:
+                    provider = OpenRouterProvider(**provider_kwargs)
+                except TypeError:
+                    provider = (
+                        OpenRouterProvider(api_key=api_key)
+                        if api_key
+                        else OpenRouterProvider()
+                    )
+
+                return OpenRouterModel(openrouter_model_id, provider=provider)
+            except ImportError:
+                try:
+                    from pydantic_ai.models.openai import OpenAIChatModel
+                    from pydantic_ai.providers.openai import OpenAIProvider
+
+                    return OpenAIChatModel(
+                        openrouter_model_id,
+                        provider=OpenAIProvider(
+                            base_url=base_url or "https://openrouter.ai/api/v1",
+                            api_key=api_key or "",
+                        ),
+                    )
+                except ImportError:
+                    return model_name
+
         if model_name.startswith("transformers:"):
             repo_id = model_name.split(":", 1)[1]
             return cls._build_transformers_model(
@@ -597,6 +832,7 @@ class GenericAgent:
                 max_tokens=max_tokens,
                 device=device,
                 torch_dtype=torch_dtype,
+                load_in_4bit=load_in_4bit,
             )
 
         if model_name.startswith("ollama:"):
@@ -652,6 +888,148 @@ class GenericAgent:
                 parts_summary.append(type(part).__name__)
         return f"[{', '.join(parts_summary)}]"
 
+    # -----------------------------------------------------------------------
+    # Human-Readable Tool Call & Tool Result Formatters
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_tool_args(part: ToolCallPart) -> dict[str, Any]:
+        """Safely extracts a dictionary of arguments from a PydanticAI `ToolCallPart`."""
+        if hasattr(part, "args_as_dict"):
+            try:
+                res = part.args_as_dict()
+                if isinstance(res, dict):
+                    return res
+            except Exception:
+                pass
+        if isinstance(part.args, dict):
+            return part.args
+        if isinstance(part.args, str) and part.args.strip():
+            try:
+                parsed = json.loads(part.args)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return {"raw": part.args}
+        return {}
+
+    @staticmethod
+    def format_tool_call_message(tool_name: str, args: dict[str, Any]) -> tuple[str, str]:
+        """Converts a raw tool invocation into a clear `(title, detail)` pair for the UI stream."""
+        lower_name = tool_name.lower()
+
+        if "flight" in lower_name:
+            origin = args.get("origin_airport") or args.get("origin") or "origin airport"
+            dest = args.get("destination") or args.get("destination_airport") or "destination"
+            dep = args.get("departure_date") or args.get("start_date")
+            ret = args.get("return_date") or args.get("end_date")
+            adults = args.get("adults", 1)
+            traveler_label = "1 passenger" if adults == 1 else f"{adults} passengers"
+            date_clause = f" ({dep} → {ret})" if dep and ret else (f" departing {dep}" if dep else "")
+            stops_clause = (
+                f", max {args['max_stops']} stop(s)" if args.get("max_stops") is not None else ""
+            )
+            return (
+                f"Searching Flights: {origin} → {dest}",
+                f"Looking for round-trip flights for {traveler_label} from {origin} to {dest}{date_clause}{stops_clause}...",
+            )
+
+        if "tour" in lower_name and "departure" not in lower_name:
+            keywords = args.get("keywords") or args.get("destination_slug_keywords") or []
+            kw_str = ", ".join(str(k) for k in keywords) if isinstance(keywords, list) else str(keywords)
+            filters = []
+            if args.get("min_days") and args.get("max_days"):
+                filters.append(f"{args['min_days']}-{args['max_days']} days")
+            elif args.get("min_days"):
+                filters.append(f"at least {args['min_days']} days")
+            elif args.get("max_days"):
+                filters.append(f"up to {args['max_days']} days")
+            if args.get("max_budget_eur"):
+                filters.append(f"budget ≤ €{args['max_budget_eur']}")
+            filter_suffix = f" ({', '.join(filters)})" if filters else ""
+            target_desc = f"'{kw_str}'" if kw_str else "matching criteria"
+            return (
+                "Searching WeRoad Itineraries",
+                f"Looking for WeRoad group tours matching {target_desc}{filter_suffix}...",
+            )
+
+        if "departure" in lower_name:
+            slug = args.get("slug") or args.get("tour_slug") or "itinerary"
+            readable_slug = str(slug).replace("-", " ").title()
+            earliest = args.get("earliest_date")
+            latest = args.get("latest_date")
+            window = ""
+            if earliest and latest:
+                window = f" between {earliest} and {latest}"
+            elif earliest:
+                window = f" from {earliest}"
+            elif latest:
+                window = f" up to {latest}"
+            return (
+                f"Checking Dates: {readable_slug}",
+                f"Checking live WeRoad departure slots ('turni') for '{readable_slug}'{window}...",
+            )
+
+        compact_args = ", ".join(f"{k}={v}" for k, v in list(args.items())[:4])
+        return (
+            f"Running Tool: {tool_name}",
+            f"Executing `{tool_name}` ({compact_args})..." if compact_args else f"Executing `{tool_name}`...",
+        )
+
+    @staticmethod
+    def format_tool_result_message(tool_name: str, content: Any) -> tuple[str, str]:
+        """Builds a concise human-readable summary from a `ToolReturnPart` payload."""
+        lower_name = tool_name.lower()
+        parsed: Any = content
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = content
+
+        if isinstance(parsed, list):
+            count = len(parsed)
+            if "flight" in lower_name:
+                prices = [
+                    item.get("price_eur")
+                    for item in parsed
+                    if isinstance(item, dict) and item.get("price_eur") is not None
+                ]
+                price_note = f" starting from €{min(prices):,.0f}" if prices else ""
+                return (
+                    "Skyscanner Flights Retrieved",
+                    f"Found {count} round-trip flight option{'s' if count != 1 else ''}{price_note}.",
+                )
+            if "departure" in lower_name:
+                available = [
+                    item
+                    for item in parsed
+                    if isinstance(item, dict) and str(item.get("status", "")).lower() != "sold out"
+                ]
+                return (
+                    "Departure Dates Retrieved",
+                    f"Found {count} scheduled date{'s' if count != 1 else ''} ({len(available)} open/confirmed).",
+                )
+            if "tour" in lower_name:
+                titles = [
+                    item.get("title")
+                    for item in parsed[:3]
+                    if isinstance(item, dict) and item.get("title")
+                ]
+                preview = f": {', '.join(titles)}" if titles else ""
+                return (
+                    "WeRoad Catalog Matches Found",
+                    f"Discovered {count} matching WeRoad itinerar{'ies' if count != 1 else 'y'}{preview}.",
+                )
+
+        snippet = str(parsed).strip().replace("\n", " ")
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+        return (
+            f"Completed: {tool_name}",
+            snippet or f"Tool `{tool_name}` finished.",
+        )
+
     async def run(self, user_prompt: Union[str, Sequence[Any]], **kwargs) -> Any:
         """
         Executes the agent run, records OpenTelemetry span & LLM token usage metrics,
@@ -685,7 +1063,7 @@ class GenericAgent:
                         raise
 
                 duration = time.perf_counter() - start_time
-                usage = extract_usage_from_result(result)
+                usage = self._extract_usage(result)
                 self.last_usage = usage
                 record_llm_usage(
                     stage=self.stage_name,
@@ -699,8 +1077,166 @@ class GenericAgent:
                     f"tokens(in={usage['input_tokens']}, out={usage['output_tokens']}, total={usage['total_tokens']})"
                 )
                 if hasattr(result, "output"):
+                    self.last_output = result.output
                     return result.output
                 return None
+            except Exception as exc:
+                duration = time.perf_counter() - start_time
+                record_llm_usage(
+                    stage=self.stage_name,
+                    model_name=self.model_name,
+                    usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 1},
+                    duration_seconds=duration,
+                    status=f"error: {exc}",
+                )
+                raise
+
+    async def run_stream(
+        self,
+        user_prompt: Union[str, Sequence[Any]],
+        **kwargs,
+    ) -> AsyncIterator[AgentStreamEvent]:
+        """
+        Executes the agent via PydanticAI's `agent.iter()` graph runner and yields
+        real-time `AgentStreamEvent` objects for intermediate model thoughts,
+        tool calls, and tool results. Stores final output in `self.last_output`.
+        """
+        snippet = self._format_log_snippet(user_prompt)
+        limits = kwargs.pop("usage_limits", UsageLimits(request_limit=self.request_limit))
+        self.last_output = None
+
+        start_time = time.perf_counter()
+        output_tool_names = {"final_result"}
+
+        with _tracer.start_as_current_span(f"agent.{self.stage_name}.stream") as span:
+            if span is not None and hasattr(span, "set_attribute"):
+                span.set_attribute("gen_ai.request.model", self.model_name)
+                span.set_attribute("weroad.stage", self.stage_name)
+                span.set_attribute("weroad.prompt.preview", snippet)
+
+            try:
+                step_counter = 0
+
+                async def _iterate_once() -> AsyncIterator[AgentStreamEvent]:
+                    nonlocal step_counter
+                    async with self.agent.iter(user_prompt, usage_limits=limits, **kwargs) as agent_run:
+                        async for node in agent_run:
+                            if Agent.is_model_request_node(node):
+                                req = getattr(node, "request", None)
+                                req_parts = getattr(req, "parts", []) if req is not None else []
+                                had_tool_return = False
+                                for part in req_parts:
+                                    if isinstance(part, ToolReturnPart):
+                                        if part.tool_name in output_tool_names:
+                                            continue
+                                        had_tool_return = True
+                                        res_title, res_detail = self.format_tool_result_message(
+                                            part.tool_name, part.content
+                                        )
+                                        yield AgentStreamEvent(
+                                            step_type=StreamStepType.TOOL_RESULT,
+                                            stage=self.stage_name,
+                                            title=res_title,
+                                            detail=res_detail,
+                                            tool_name=part.tool_name,
+                                        )
+
+                                step_counter += 1
+                                if had_tool_return:
+                                    yield AgentStreamEvent(
+                                        step_type=StreamStepType.REASONING,
+                                        stage=self.stage_name,
+                                        title="Analyzing Tool Results",
+                                        detail="Evaluating retrieved tour dates and flight options to decide the next step...",
+                                    )
+                                elif step_counter == 1:
+                                    yield AgentStreamEvent(
+                                        step_type=StreamStepType.REASONING,
+                                        stage=self.stage_name,
+                                        title="Planning Search Strategy",
+                                        detail="Determining which WeRoad itineraries, departure slots, and Skyscanner routes to query...",
+                                    )
+
+                            elif Agent.is_call_tools_node(node):
+                                model_resp = getattr(node, "model_response", None)
+                                resp_parts = getattr(model_resp, "parts", []) if model_resp is not None else []
+                                for part in resp_parts:
+                                    if ThinkingPart is not None and isinstance(part, ThinkingPart):
+                                        thought_text = (part.content or "").strip()
+                                        if thought_text:
+                                            yield AgentStreamEvent(
+                                                step_type=StreamStepType.REASONING,
+                                                stage=self.stage_name,
+                                                title="Agent Reasoning",
+                                                detail=thought_text,
+                                            )
+                                    elif isinstance(part, TextPart):
+                                        text_thought = (part.content or "").strip()
+                                        if text_thought and not text_thought.startswith("{"):
+                                            yield AgentStreamEvent(
+                                                step_type=StreamStepType.REASONING,
+                                                stage=self.stage_name,
+                                                title="Agent Reasoning",
+                                                detail=text_thought,
+                                            )
+                                    elif isinstance(part, ToolCallPart):
+                                        if part.tool_name in output_tool_names:
+                                            yield AgentStreamEvent(
+                                                step_type=StreamStepType.REASONING,
+                                                stage=self.stage_name,
+                                                title="Synthesizing Final Proposal",
+                                                detail="Organizing matching WeRoad tours, verified departure dates, and Skyscanner flights into your itinerary...",
+                                            )
+                                            continue
+
+                                        args_dict = self._extract_tool_args(part)
+                                        call_title, call_detail = self.format_tool_call_message(
+                                            part.tool_name, args_dict
+                                        )
+                                        yield AgentStreamEvent(
+                                            step_type=StreamStepType.TOOL_CALL,
+                                            stage=self.stage_name,
+                                            title=call_title,
+                                            detail=call_detail,
+                                            tool_name=part.tool_name,
+                                            tool_args=args_dict,
+                                        )
+
+                        run_result = agent_run.result
+                        duration = time.perf_counter() - start_time
+                        usage = self._extract_usage(run_result)
+                        self.last_usage = usage
+                        record_llm_usage(
+                            stage=self.stage_name,
+                            model_name=self.model_name,
+                            usage=usage,
+                            duration_seconds=duration,
+                            status="ok",
+                        )
+                        if run_result is not None and hasattr(run_result, "output"):
+                            self.last_output = run_result.output
+
+                try:
+                    async for ev in _iterate_once():
+                        yield ev
+                except Exception as run_exc:
+                    if self.mcp_config_path and "Connection closed" in str(run_exc):
+                        logger.warning(
+                            f"MCP connection closed during streaming [{self.stage_name}]; reloading MCP toolsets and retrying once..."
+                        )
+                        yield AgentStreamEvent(
+                            step_type=StreamStepType.STATUS,
+                            stage=self.stage_name,
+                            title="Reconnecting Tool Server",
+                            detail="Re-establishing connection to WeRoad & Skyscanner tool server...",
+                        )
+                        self.toolsets = self._build_mcp_toolsets()
+                        self.agent._user_toolsets = self.toolsets  # type: ignore[attr-defined]
+                        async for ev in _iterate_once():
+                            yield ev
+                    else:
+                        raise
+
             except Exception as exc:
                 duration = time.perf_counter() - start_time
                 record_llm_usage(

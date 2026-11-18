@@ -6,7 +6,7 @@ services:
     container_name: weroad-tempo
     command: ["-config.file=/etc/tempo.yaml"]
     volumes:
-      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - ./grafana/tempo.yaml:/etc/tempo.yaml:ro
       - tempo-data:/var/tempo
     ports:
       - "3200:3200"   # Tempo HTTP Query & Metrics
@@ -18,7 +18,7 @@ services:
     container_name: weroad-loki
     command: ["-config.file=/etc/loki/local-config.yaml"]
     volumes:
-      - ./observability/loki.yaml:/etc/loki/local-config.yaml:ro
+      - ./grafana/loki.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki
     ports:
       - "3100:3100"   # Loki HTTP & Native OTLP Logs (/otlp/v1/logs)
@@ -30,7 +30,7 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--web.enable-remote-write-receiver"
     volumes:
-      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./grafana/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"
@@ -44,9 +44,9 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
     volumes:
-      - ./observability/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
-      - ./observability/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
-      - ./observability/grafana-dashboard.json:/var/lib/grafana/dashboards/weroad-observability.json:ro
+      - ./grafana/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./grafana/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./grafana/grafana-dashboard.json:/var/lib/grafana/dashboards/weroad-observability.json:ro
       - grafana-data:/var/lib/grafana
     ports:
       - "3000:3000"
