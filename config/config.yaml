@@ -36,6 +36,7 @@ pipeline:
   # output retries, so keep generous request limits for both stages.
   intent_request_limit: 4
   proposal_request_limit: 25
+  tool_retries: 4
   require_departure_airport: true
 
 llama_guard:

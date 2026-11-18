@@ -102,6 +102,32 @@ Planning a group adventure involves coordinating tour availability, age cohorts,
 
 ---
 
+## Demo & Screenshots
+
+Sample captures and an exported interactive snapshot of the assistant in action are available in the [`demo-example/`](demo-example/) folder:
+
+### 1. Interactive Web UI & Live Reasoning Stream
+
+The React + Tailwind CSS interface (`index.html`) streams safety guardrail checks, model reasoning tokens, parsed travel criteria, and MCP tool calls in real time alongside departure airport controls and starter prompts:
+
+![WeRoad Agentic Travel Assistant Web UI](demo-example/webui.png)
+
+### 2. Travel Itinerary & Skyscanner Flight Proposal Output
+
+Once Stage 2 completes, the assistant renders structured WeRoad tour cards, live departure date tables (*turni*), EUR pricing, age cohorts, and matched Skyscanner round-trip flight options:
+
+- **Interactive HTML Snapshot:** [WeRoad.it - AI Trip & Flight Finder.html](demo-example/WeRoad.it%20-%20AI%20Trip%20&%20Flight%20Finder.html) *(open directly in a browser to explore the captured response)*
+
+![WeRoad.it - AI Trip & Flight Finder Output](demo-example/WeRoad.it%20-%20AI%20Trip%20&%20Flight%20Finder.png)
+
+### 3. Grafana LLM Performance & Observability Dashboard
+
+Every query emits distributed traces, structured logs, and Prometheus metrics visualized in the pre-provisioned Grafana dashboard (`grafana/grafana-dashboard.json`):
+
+![Grafana Observability Dashboard](demo-example/grafana.png)
+
+---
+
 ## Project Structure
 
 ```text
@@ -109,6 +135,11 @@ Travel-AI-assistant/
 ├── config/
 │   ├── config.yaml                              # Centralized pipeline, OpenRouter reasoning, guardrail, scraper & OTel config
 │   └── mcp_config.json                          # MCP stdio server command definition ("weroad")
+├── demo-example/
+│   ├── grafana.png                              # Grafana observability dashboard screenshot
+│   ├── webui.png                                # Web UI & live reasoning stream screenshot
+│   ├── WeRoad.it - AI Trip & Flight Finder.html # Exported interactive HTML demo output
+│   └── WeRoad.it - AI Trip & Flight Finder.png  # Screenshot of rendered trip & flight proposal output
 ├── grafana/
 │   ├── grafana-dashboard.json                   # Pre-built Grafana dashboard definition
 │   ├── grafana-dashboards.yaml                  # Grafana dashboard provisioning config
@@ -291,7 +322,7 @@ HF_TOKEN=your_huggingface_token_here
 - **`flight_search`**:
   - `enabled`, `provider` (`"skyscanner"`), `currency` (`"EUR"`), `market` (`"IT"`), `locale` (`"it-IT"`), `skyscanner_base_url` (`https://www.skyscanner.it/trasporti/voli`), and `rapidapi_host`.
 - **`server`**:
-  - `host` (`"0.0.0.0"`), `port` (`8000`), `api_base_url`, and `cors_origins`.
+  - `host` (`"0.0.0.0"`), `port` (`"8000"`), `api_base_url`, and `cors_origins`.
 - **`observability`**:
   - `enabled`, `service_name`, OTLP endpoints for Tempo (`4318`) and Loki (`3100`), `grafana_base_url`, `capture_prompts`, and `json_logs`.
 - **`schemas`**:
@@ -367,7 +398,7 @@ PYTHONPATH=src python -m ai_assistant.mcp_server.weroad_mcp
    docker-compose up -d
    ```
 2. **Access the dashboards**:
-   - **Grafana**: `http://localhost:3000` (auto-provisioned with `grafana/grafana-datasources.yaml`, `grafana/grafana-dashboards.yaml`, and `grafana/grafana-dashboard.json`)
+   - **Grafana**: `http://localhost:3000` (auto-provisioned with `grafana/grafana-datasources.yaml`, `grafana/grafana-dashboards.yaml`, and `grafana/grafana-dashboard.json` — see preview in [`demo-example/grafana.png`](demo-example/grafana.png))
    - **Prometheus**: `http://localhost:9090` (configured via `grafana/prometheus.yaml`)
    - **Tempo**: `http://localhost:3200` / OTLP HTTP `4318` (configured via `grafana/tempo.yaml`)
    - **Loki**: `http://localhost:3100` (configured via `grafana/loki.yaml`)

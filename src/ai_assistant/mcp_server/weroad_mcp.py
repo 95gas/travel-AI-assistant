@@ -11,6 +11,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from fastmcp.exceptions import ToolError
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = Path(__file__).resolve().parents[2]
@@ -71,19 +72,21 @@ async def get_tour_departures(
     """
     Fetch live scheduled departure dates ('turni'), prices in EUR, age brackets,
     and availability statuses ('Confermato', 'Quasi pieno', 'Disponibile', 'Sold out')
-    for a specific WeRoad tour slug (e.g., 'giappone' or 'islanda-360').
+    for a WeRoad tour slug. The slug MUST be copied exactly from the `slug` field
+    of a result returned by `search_weroad_tours`; never guess or invent slugs.
     """
-    logger.info(
-        f"MCP tool `get_tour_departures` called for slug='{slug}' "
-        f"[{earliest_date} .. {latest_date}]"
-    )
-    slots = await _client.fetch_departures(
-        slug=slug,
-        earliest_date=earliest_date,
-        latest_date=latest_date,
-    )
-    return [slot.model_dump(mode="json") for slot in slots]
-
+    logger.info(...)
+    try:
+        slots = await _client.fetch_departures(
+            slug=slug, earliest_date=earliest_date, latest_date=latest_date,
+        )
+        return [slot.model_dump(mode="json") for slot in slots]
+    except Exception as exc:
+        logger.warning(f"get_tour_departures failed for slug='{slug}': {exc}")
+        raise ToolError(
+            f"Could not fetch departures for slug '{slug}': {exc}. "
+            "Call `search_weroad_tours` and use the exact slug it returns, or try another tour."
+        ) from exc
 
 @mcp.tool()
 async def search_flights(

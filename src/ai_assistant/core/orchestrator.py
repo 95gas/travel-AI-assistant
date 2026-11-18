@@ -73,12 +73,15 @@ class WeRoadTravelAssistant:
         # Input & Output Safety Guardrail
         self.guardrail = LlamaGuardModerator(config=self.config_manager.llama_guard_config)
 
+        tool_retries = self.config_manager.pipeline_config.tool_retries
+
         # Stage 1: Natural-language query -> TravelSearchIntent
         self.intent_agent = GenericAgent(
             llm_settings=intent_llm,
             system_prompt=intent_system_prompt,
             output_type=TravelSearchIntent,
             request_limit=self.config_manager.pipeline_config.intent_request_limit,
+            retries=tool_retries,
             stage_name="intent_extraction",
         )
 
@@ -89,6 +92,7 @@ class WeRoadTravelAssistant:
             output_type=TravelProposalResponse,
             mcp_config_path=self.mcp_config_path,
             request_limit=self.config_manager.pipeline_config.proposal_request_limit,
+            retries=tool_retries,
             stage_name="proposal_synthesis",
         )
 

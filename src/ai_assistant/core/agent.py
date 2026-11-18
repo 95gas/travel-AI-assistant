@@ -83,6 +83,7 @@ class GenericAgent:
         mcp_config_path: Optional[Union[str, Path]] = None,
         builtin_tools: Optional[Sequence[Any]] = None,
         request_limit: int = 5,
+        retries: int = 3,
         stage_name: str = "generic_agent",
     ):
         self.model_name = llm_settings.model_name
@@ -101,6 +102,7 @@ class GenericAgent:
         self.output_type = output_type
         self.mcp_config_path = Path(mcp_config_path) if mcp_config_path else None
         self.request_limit = request_limit
+        self.retries = retries
         self.stage_name = stage_name
         self.last_usage: dict[str, int] = {
             "input_tokens": 0,
@@ -133,6 +135,7 @@ class GenericAgent:
             "model": resolved_model,
             "system_prompt": self.system_prompt,
             "model_settings": model_settings,
+            "retries": self.retries,
         }
         if self.output_type is not None:
             agent_kwargs["output_type"] = self.output_type
@@ -330,6 +333,8 @@ class GenericAgent:
 
             toolsets = load_mcp_toolsets(config_to_load)
             for ts in toolsets:
+                if hasattr(ts, "max_retries"):
+                    ts.max_retries = self.retries
                 client = getattr(getattr(ts, "wrapped", ts), "client", None)
                 if client:
                     client._init_timeout = 60.0

@@ -250,6 +250,7 @@ class WeRoadPipelineConfig(BaseModel):
     llm_proposal: Optional[LLMConfig] = None
     intent_request_limit: int = Field(default=4, ge=1)
     proposal_request_limit: int = Field(default=25, ge=1)
+    tool_retries: int = Field(default=4, ge=1)
     require_departure_airport: bool = Field(default=True)
 
     @property
